@@ -1,0 +1,43 @@
+[Unit]
+Description=10mila System + MySQL Monitor
+Documentation=https://github.com/your-org/10mila
+After=network.target mysql.service mariadb.service
+Wants=mysql.service mariadb.service
+
+[Service]
+Type=simple
+ExecStartPre=/bin/mkdir -p /dev/shm/10mila
+ExecStartPre=-/bin/cp /opt/10mila-sysmon/healthcheck.html /dev/shm/10mila/healthcheck.html
+ExecStart=/usr/bin/python3 /opt/10mila-sysmon/collector.py --config /etc/10mila-sysmon/config.ini
+Restart=always
+RestartSec=5
+
+# Run as dedicated low-privilege user
+User=sysmon
+Group=sysmon
+
+# Allow reading /proc, running lsof, and binding a port < 1024 if needed.
+# CAP_NET_BIND_SERVICE is only required if http_port is set below 1024.
+# CAP_DAC_READ_SEARCH lets lsof count all open files across all processes.
+AmbientCapabilities=CAP_DAC_READ_SEARCH CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH CAP_NET_BIND_SERVICE
+
+# /dev/shm is world-writable; the output directory is created by the script
+# Grant write access to the symlink target directory via supplementary group
+# (the install script sets group ownership on /opt/OLA_6/webpages/klient)
+SupplementaryGroups=www-data
+
+# Hardening — restrict what the process can touch
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+NoNewPrivileges=true
+ReadWritePaths=/dev/shm/10mila /opt/OLA_6/webpages/klient /opt/OLA_6/webpages/sysmon
+
+# stdout/stderr go to journald — view with:  journalctl -u 10mila-sysmon -f
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=10mila-sysmon
+
+[Install]
+WantedBy=multi-user.target

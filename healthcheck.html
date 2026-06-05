@@ -1,0 +1,704 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>10mila — System Health</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+<style>
+  :root {
+    --bg:       #f5f7fa;
+    --surface:  #ffffff;
+    --border:   #d0d7de;
+    --text:     #0d1117;
+    --muted:    #57606a;
+    --green:    #1a7f37;
+    --yellow:   #9a6700;
+    --red:      #cf222e;
+    --blue:     #0969da;
+    --purple:   #8250df;
+    --cyan:     #0598a8;
+    --orange:   #bc4c00;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+    font-size: 13px;
+    min-height: 100vh;
+  }
+
+  header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 20px;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    position: sticky;
+    top: 0;
+    z-index: 100;
+  }
+  header h1 { font-size: 16px; font-weight: 600; letter-spacing: .5px; }
+  #meta      { font-size: 11px; color: var(--muted); text-align: right; line-height: 1.6; }
+  #status-dot {
+    width: 10px; height: 10px; border-radius: 50%;
+    background: var(--muted); display: inline-block;
+    margin-right: 6px; vertical-align: middle;
+    transition: background .3s;
+  }
+
+  main { padding: 16px 20px; }
+
+  /* ── Gauge cards ── */
+  .gauges {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+    gap: 12px;
+    margin-bottom: 20px;
+  }
+
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 14px 16px;
+    position: relative;
+    overflow: hidden;
+  }
+  .card-label  { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .6px; margin-bottom: 6px; }
+  .card-value  { font-size: 26px; font-weight: 700; line-height: 1.1; }
+  .card-unit   { font-size: 11px; color: var(--muted); margin-left: 3px; }
+  .card-sub    { font-size: 11px; color: var(--muted); margin-top: 4px; }
+
+  .bar-bg {
+    position: absolute;
+    bottom: 0; left: 0; right: 0;
+    height: 4px;
+    background: var(--border);
+  }
+  .bar-fill {
+    height: 100%;
+    transition: width .5s ease, background .5s;
+    border-radius: 2px;
+  }
+
+  /* ── Graphs ── */
+  .charts {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(480px, 1fr));
+    gap: 14px;
+  }
+
+  .chart-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 14px 16px;
+  }
+  .chart-title {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: .6px;
+    margin-bottom: 10px;
+  }
+  .chart-card canvas { display: block; }
+
+  /* ── MySQL section ── */
+  .section-title {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: .8px;
+    margin: 20px 0 10px;
+    padding-bottom: 6px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .offline-badge {
+    display: inline-block;
+    background: var(--red);
+    color: #fff;
+    font-size: 10px;
+    font-weight: 700;
+    padding: 2px 7px;
+    border-radius: 3px;
+    vertical-align: middle;
+    margin-left: 8px;
+  }
+  .status-green { border-left: 3px solid var(--green); }
+  .status-red   { border-left: 3px solid var(--red);   }
+
+  @media (max-width: 600px) {
+    .charts { grid-template-columns: 1fr; }
+    .gauges { grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1><span id="status-dot"></span>10mila — System Health</h1>
+  <div id="meta">Loading…</div>
+</header>
+
+<main>
+  <!-- OS gauges -->
+  <div class="section-title">System</div>
+  <div class="gauges" id="os-gauges">
+    <div class="card" id="g-cpu">
+      <div class="card-label">CPU</div>
+      <div class="card-value" id="v-cpu">—<span class="card-unit">%</span></div>
+      <div class="card-sub"  id="s-cpu">— cores</div>
+      <div class="bar-bg"><div class="bar-fill" id="b-cpu" style="width:0%"></div></div>
+    </div>
+    <div class="card" id="g-mem">
+      <div class="card-label">Memory</div>
+      <div class="card-value" id="v-mem">—<span class="card-unit">%</span></div>
+      <div class="card-sub"  id="s-mem">— / — GB</div>
+      <div class="bar-bg"><div class="bar-fill" id="b-mem" style="width:0%"></div></div>
+    </div>
+    <div class="card" id="g-swap">
+      <div class="card-label">Swap</div>
+      <div class="card-value" id="v-swap">—<span class="card-unit">%</span></div>
+      <div class="card-sub"  id="s-swap">— / — MB</div>
+      <div class="bar-bg"><div class="bar-fill" id="b-swap" style="width:0%"></div></div>
+    </div>
+    <div class="card" id="g-load">
+      <div class="card-label">Load (1m)</div>
+      <div class="card-value" id="v-load">—</div>
+      <div class="card-sub"  id="s-load">5m — &nbsp; 15m —</div>
+    </div>
+    <div class="card" id="g-proc">
+      <div class="card-label">Processes</div>
+      <div class="card-value" id="v-proc">—</div>
+      <div class="card-sub"  id="s-proc">uptime —</div>
+    </div>
+    <div class="card" id="g-fd">
+      <div class="card-label">Open files</div>
+      <div class="card-value" id="v-fd">—</div>
+      <div class="card-sub"  id="s-fd">— % of max</div>
+      <div class="bar-bg"><div class="bar-fill" id="b-fd" style="width:0%"></div></div>
+    </div>
+  </div>
+
+  <!-- MySQL gauges -->
+  <div class="section-title" id="mysql-section-title">MySQL / MariaDB</div>
+  <div class="gauges" id="mysql-gauges">
+    <div class="card">
+      <div class="card-label">Queries/s</div>
+      <div class="card-value" id="v-qps">—</div>
+      <div class="card-sub"  id="s-qps">SELECT — &nbsp; INSERT —</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Connections</div>
+      <div class="card-value" id="v-conn">—</div>
+      <div class="card-sub"  id="s-conn">max used — / limit —</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Buffer pool hit</div>
+      <div class="card-value" id="v-bphit">—<span class="card-unit">%</span></div>
+      <div class="card-sub"  id="s-bphit">— MB pool</div>
+      <div class="bar-bg"><div class="bar-fill" id="b-bphit" style="width:0%"></div></div>
+    </div>
+    <div class="card">
+      <div class="card-label">Slow queries</div>
+      <div class="card-value" id="v-slow">—</div>
+      <div class="card-sub"  id="s-slow">open tables —</div>
+    </div>
+    <div class="card">
+      <div class="card-label">DB traffic</div>
+      <div class="card-value" id="v-dbtx">—<span class="card-unit">KB/s</span></div>
+      <div class="card-sub"  id="s-dbtx">↑— ↓—</div>
+    </div>
+    <div class="card">
+      <div class="card-label">DB uptime</div>
+      <div class="card-value" id="v-dbup">—</div>
+      <div class="card-sub"  id="s-dbver">—</div>
+    </div>
+  </div>
+
+  <!-- OLA Java gauges -->
+  <div class="section-title" id="java-section-title">OLA Java</div>
+  <div class="gauges" id="java-gauges">
+    <div class="card" id="g-java-status">
+      <div class="card-label">Process</div>
+      <div class="card-value" id="v-java-status">—</div>
+      <div class="card-sub"  id="s-java-status">PID —</div>
+    </div>
+    <div class="card">
+      <div class="card-label">CPU</div>
+      <div class="card-value" id="v-java-cpu">—<span class="card-unit">%</span></div>
+      <div class="card-sub"  id="s-java-cpu">process usage</div>
+      <div class="bar-bg"><div class="bar-fill" id="b-java-cpu" style="width:0%"></div></div>
+    </div>
+    <div class="card">
+      <div class="card-label">Memory (RSS)</div>
+      <div class="card-value" id="v-java-mem">—<span class="card-unit">MB</span></div>
+      <div class="card-sub"  id="s-java-mem">virt — MB</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Threads</div>
+      <div class="card-value" id="v-java-thr">—</div>
+      <div class="card-sub"  id="s-java-thr">OS threads</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Open FDs</div>
+      <div class="card-value" id="v-java-fds">—</div>
+      <div class="card-sub"  id="s-java-fds">file descriptors</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Uptime</div>
+      <div class="card-value" id="v-java-up">—</div>
+      <div class="card-sub"  id="s-java-up">process age</div>
+    </div>
+  </div>
+
+  <!-- Graphs -->
+  <div class="section-title">Graphs (last 30 min)</div>
+  <div class="charts">
+    <div class="chart-card">
+      <div class="chart-title">CPU &amp; Load</div>
+      <canvas id="ch-cpu" height="120"></canvas>
+    </div>
+    <div class="chart-card">
+      <div class="chart-title">Memory &amp; Swap</div>
+      <canvas id="ch-mem" height="120"></canvas>
+    </div>
+    <div class="chart-card">
+      <div class="chart-title">Open Files (kernel)</div>
+      <canvas id="ch-fd" height="120"></canvas>
+    </div>
+    <div class="chart-card">
+      <div class="chart-title">Network (all interfaces, Mbit/s)</div>
+      <canvas id="ch-net" height="120"></canvas>
+    </div>
+    <div class="chart-card">
+      <div class="chart-title">Disk I/O (all disks)</div>
+      <canvas id="ch-disk" height="120"></canvas>
+    </div>
+    <div class="chart-card">
+      <div class="chart-title">MySQL — Queries/s &amp; Connections</div>
+      <canvas id="ch-mysql" height="120"></canvas>
+    </div>
+    <div class="chart-card">
+      <div class="chart-title">MySQL — Buffer Pool Hit %</div>
+      <canvas id="ch-bphit" height="120"></canvas>
+    </div>
+    <div class="chart-card">
+      <div class="chart-title">OLA Java — CPU % &amp; Memory MB</div>
+      <canvas id="ch-java-proc" height="120"></canvas>
+    </div>
+    <div class="chart-card">
+      <div class="chart-title">OLA Java — Threads &amp; Open FDs</div>
+      <canvas id="ch-java-thr" height="120"></canvas>
+    </div>
+  </div>
+</main>
+
+<script>
+// ── Config ────────────────────────────────────────────────────────────────────
+// When served by the built-in HTTP server (port 8082), both this HTML
+// and the JSON live in the same directory — use a relative URL.
+// If served by Jetty instead, change to '/sysmon/healthcheck.json'.
+const JSON_URL      = 'healthcheck.json';
+const REFRESH_MS    = 5000;
+const MAX_LABELS    = 360;   // trim labels if history grows very long
+
+// ── Chart defaults ─────────────────────────────────────────────────────────
+Chart.defaults.color          = '#57606a';
+Chart.defaults.borderColor    = '#d0d7de';
+Chart.defaults.font.family    = "'Segoe UI', system-ui, sans-serif";
+Chart.defaults.font.size      = 11;
+Chart.defaults.plugins.legend.labels.boxWidth = 10;
+Chart.defaults.plugins.legend.labels.padding  = 12;
+
+const CHART_OPT = (yLabel, yMax) => ({
+  responsive: true,
+  animation: false,
+  interaction: { mode: 'index', intersect: false },
+  scales: {
+    x: {
+      ticks: {
+        maxTicksLimit: 8,
+        maxRotation: 0,
+        callback: (_, i, arr) => {
+          // only show first/last and evenly spaced
+          if (i === 0 || i === arr.length - 1 || i % Math.ceil(arr.length / 6) === 0)
+            return arr[i]?.label ?? '';
+          return '';
+        }
+      },
+      grid: { display: false }
+    },
+    y: {
+      beginAtZero: true,
+      ...(yMax !== undefined ? { max: yMax, min: 0 } : {}),
+      title: { display: !!yLabel, text: yLabel ?? '' },
+      ticks: { maxTicksLimit: 5 }
+    }
+  },
+  plugins: { tooltip: { enabled: true } }
+});
+
+function makeChart(id, datasets, yLabel, yMax) {
+  const ctx = document.getElementById(id).getContext('2d');
+  return new Chart(ctx, {
+    type: 'line',
+    data: { labels: [], datasets: datasets.map(d => ({
+      ...d,
+      data: [],
+      pointRadius: 0,
+      tension: 0.3,
+      borderWidth: 1.5,
+      fill: d.fill ?? false,
+    }))},
+    options: CHART_OPT(yLabel, yMax),
+  });
+}
+
+// ── Colour helpers ────────────────────────────────────────────────────────────
+function pctColor(pct, warn = 70, crit = 90) {
+  if (pct >= crit) return 'var(--red)';
+  if (pct >= warn) return 'var(--yellow)';
+  return 'var(--green)';
+}
+
+function setBar(id, pct, warn, crit) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.style.width      = Math.min(pct, 100) + '%';
+  el.style.background = pctColor(pct, warn, crit);
+}
+
+function setCard(id, pct, warn, crit) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.style.borderColor = pctColor(pct, warn, crit);
+}
+
+// ── Format helpers ────────────────────────────────────────────────────────────
+function fmtUptime(s) {
+  if (!s) return '—';
+  const d = Math.floor(s / 86400);
+  const h = Math.floor((s % 86400) / 3600);
+  const m = Math.floor((s % 3600)  / 60);
+  if (d > 0) return `${d}d ${h}h`;
+  if (h > 0) return `${h}h ${m}m`;
+  return `${m}m`;
+}
+
+function fmtMB(mb) {
+  if (mb >= 1024) return (mb / 1024).toFixed(1) + ' GB';
+  return mb.toFixed(0) + ' MB';
+}
+
+function fmtTs(iso) {
+  const d = new Date(iso);
+  return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+}
+
+function trimLabels(labels) {
+  return labels.slice(-MAX_LABELS).map(fmtTs);
+}
+
+function trimData(arr) {
+  return arr.slice(-MAX_LABELS);
+}
+
+// ── Charts ────────────────────────────────────────────────────────────────────
+// Each metric has its own unique colour (13 distinct hues)
+const C = {
+  cpu:    '#1971c2',  // blue
+  load1m: '#e67700',  // orange
+  load5m: '#b08900',  // amber
+  mem:    '#2f9e44',  // green
+  swap:   '#c92a2a',  // red
+  openfd: '#0c8599',  // teal
+  rx:     '#7048e8',  // violet
+  tx:     '#d6336c',  // rose/pink
+  dread:  '#5c940d',  // lime green
+  dwrite: '#a61e4d',  // crimson
+  qps:    '#087f5b',  // emerald
+  conn:   '#d08700',  // golden yellow
+  bphit:  '#ae3ec9',  // magenta/purple
+  // OLA Java
+  jcpu:   '#c92a2a',  // deep red
+  jmem:   '#e67700',  // amber
+  jthr:   '#364fc7',  // indigo
+  jfds:   '#0b7285',  // dark teal
+};
+
+const charts = {
+  cpu:   makeChart('ch-cpu',  [
+    { label: 'CPU %',  borderColor: C.cpu,    backgroundColor: 'rgba(25,113,194,.08)', fill: true },
+    { label: 'Load 1m',borderColor: C.load1m },
+    { label: 'Load 5m',borderColor: C.load5m },
+  ], '%', 100),
+
+  mem:   makeChart('ch-mem',  [
+    { label: 'Mem %',  borderColor: C.mem,    backgroundColor: 'rgba(47,158,68,.08)', fill: true },
+    { label: 'Swap %', borderColor: C.swap },
+  ], '%', 100),
+
+  fd:    makeChart('ch-fd',   [
+    { label: 'Open files', borderColor: C.openfd, backgroundColor: 'rgba(12,133,153,.07)', fill: true },
+  ], 'count'),
+
+  net:   makeChart('ch-net',  [
+    { label: 'RX Mbit/s', borderColor: C.rx },
+    { label: 'TX Mbit/s', borderColor: C.tx },
+  ], 'Mbit/s'),
+
+  disk:  makeChart('ch-disk', [
+    { label: 'Read MB/s',  borderColor: C.dread },
+    { label: 'Write MB/s', borderColor: C.dwrite },
+  ], 'MB/s'),
+
+  mysql: makeChart('ch-mysql',[
+    { label: 'QPS',         borderColor: C.qps,  yAxisID: 'y' },
+    { label: 'Connections', borderColor: C.conn, yAxisID: 'y1' },
+  ], null),
+
+  bphit: makeChart('ch-bphit',[
+    { label: 'Buffer pool hit %', borderColor: C.bphit, backgroundColor: 'rgba(174,62,201,.07)', fill: true },
+  ], '%', 100),
+
+  javaProc: makeChart('ch-java-proc', [
+    { label: 'CPU %',    borderColor: C.jcpu, backgroundColor: 'rgba(201,42,42,.07)', fill: true, yAxisID: 'y' },
+    { label: 'Mem MB',   borderColor: C.jmem, yAxisID: 'y1' },
+  ], null),
+
+  javaThr: makeChart('ch-java-thr', [
+    { label: 'Threads',  borderColor: C.jthr },
+    { label: 'Open FDs', borderColor: C.jfds },
+  ], 'count'),
+};
+
+// Second Y-axis for MySQL chart (connections on right)
+charts.mysql.options.scales.y1 = {
+  type: 'linear', position: 'right',
+  beginAtZero: true,
+  grid: { drawOnChartArea: false },
+  ticks: { maxTicksLimit: 5 }
+};
+charts.mysql.update();
+
+// Second Y-axis for Java process chart (Memory MB on right)
+charts.javaProc.options.scales.y  = { type: 'linear', position: 'left',  beginAtZero: true, ticks: { maxTicksLimit: 5 } };
+charts.javaProc.options.scales.y1 = { type: 'linear', position: 'right', beginAtZero: true, grid: { drawOnChartArea: false }, ticks: { maxTicksLimit: 5 } };
+charts.javaProc.update();
+
+// ── Update UI ─────────────────────────────────────────────────────────────────
+function updateGauges(d) {
+  const cur   = d.current;
+  const mysql = d.mysql;
+  const hist  = d.history;
+  const meta  = d.meta;
+
+  // ── Header
+  document.getElementById('status-dot').style.background = 'var(--green)';
+  document.getElementById('meta').innerHTML =
+    `<b>${meta.hostname}</b> &nbsp;·&nbsp; ${fmtTs(d.collected_at)}<br>` +
+    `interval ${meta.interval_s}s &nbsp;·&nbsp; ${hist.timestamps.length} samples`;
+
+  // ── CPU
+  const cpu    = cur.cpu;
+  const cpuPct = cpu.usage_pct;
+  document.getElementById('v-cpu').firstChild.textContent = cpuPct.toFixed(1);
+  document.getElementById('s-cpu').textContent = `${cpu.core_count} cores`;
+  setBar('b-cpu', cpuPct, 70, 90);
+  setCard('g-cpu', cpuPct, 70, 90);
+
+  // ── Memory
+  const mem    = cur.memory;
+  document.getElementById('v-mem').firstChild.textContent = mem.usage_pct.toFixed(1);
+  document.getElementById('s-mem').textContent =
+    `${fmtMB(mem.used_mb)} / ${fmtMB(mem.total_mb)}`;
+  setBar('b-mem', mem.usage_pct, 80, 95);
+  setCard('g-mem', mem.usage_pct, 80, 95);
+
+  // ── Swap
+  document.getElementById('v-swap').firstChild.textContent = mem.swap_pct.toFixed(1);
+  document.getElementById('s-swap').textContent =
+    `${fmtMB(mem.swap_used_mb)} / ${fmtMB(mem.swap_total_mb)}`;
+  setBar('b-swap', mem.swap_pct, 30, 70);
+  setCard('g-swap', mem.swap_pct, 30, 70);
+
+  // ── Load
+  const load = cur.load;
+  document.getElementById('v-load').textContent = load.avg_1m.toFixed(2);
+  document.getElementById('s-load').textContent =
+    `5m ${load.avg_5m.toFixed(2)}  ·  15m ${load.avg_15m.toFixed(2)}`;
+
+  // ── Processes / uptime
+  document.getElementById('v-proc').textContent = cur.system.processes;
+  document.getElementById('s-proc').textContent = 'up ' + fmtUptime(cur.system.uptime_s);
+
+  // ── Open files
+  const ofd = cur.open_files;
+  document.getElementById('v-fd').textContent = ofd.kernel_open.toLocaleString();
+  let fdSub = `${ofd.usage_pct.toFixed(1)}% of ${ofd.kernel_max.toLocaleString()}`;
+  if (ofd.lsof_count !== undefined)
+    fdSub += ` (lsof: ${ofd.lsof_count.toLocaleString()})`;
+  document.getElementById('s-fd').textContent = fdSub;
+  setBar('b-fd', ofd.usage_pct, 50, 80);
+  setCard('g-fd', ofd.usage_pct, 50, 80);
+
+  // ── MySQL
+  const mysqlTitle = document.getElementById('mysql-section-title');
+  if (!mysql.available) {
+    mysqlTitle.innerHTML = 'MySQL / MariaDB <span class="offline-badge">OFFLINE</span>';
+    ['v-qps','v-conn','v-bphit','v-slow','v-dbtx','v-dbup'].forEach(id => {
+      const el = document.getElementById(id);
+      if (el) el.textContent = '—';
+    });
+    return;
+  }
+  mysqlTitle.innerHTML = 'MySQL / MariaDB';
+
+  const q  = mysql.queries;
+  const c  = mysql.connections;
+  const ib = mysql.innodb;
+  const by = mysql.bytes;
+
+  document.getElementById('v-qps').textContent = q.qps.toFixed(1);
+  document.getElementById('s-qps').textContent =
+    `SELECT ${q.selects_s.toFixed(1)}  INS ${q.inserts_s.toFixed(1)}`;
+
+  document.getElementById('v-conn').textContent = c.current;
+  document.getElementById('s-conn').textContent =
+    `max used ${c.max_used} / ${c.limit}`;
+
+  const bphit = ib.buffer_pool_hit_pct;
+  document.getElementById('v-bphit').firstChild.textContent = bphit.toFixed(2);
+  document.getElementById('s-bphit').textContent = `${ib.buffer_pool_mb} MB pool`;
+  // Invert colors: low hit rate = bad
+  const bphitBad = 100 - bphit;
+  setBar('b-bphit', bphit, 99.5, 100);  // bar shows fill, color inverted below
+  document.getElementById('b-bphit').style.background =
+    bphit < 95 ? 'var(--red)' : bphit < 99 ? 'var(--yellow)' : 'var(--green)';
+
+  document.getElementById('v-slow').textContent = q.slow_queries.toLocaleString();
+  document.getElementById('s-slow').textContent = `open tables ${q.open_tables}`;
+
+  const txKbs = (by.sent_mb_s * 1024).toFixed(1);
+  const rxKbs = (by.received_mb_s * 1024).toFixed(1);
+  document.getElementById('v-dbtx').firstChild.textContent = txKbs;
+  document.getElementById('s-dbtx').textContent = `↑${txKbs} ↓${rxKbs} KB/s`;
+
+  document.getElementById('v-dbup').textContent = fmtUptime(mysql.uptime_s);
+  document.getElementById('s-dbver').textContent = mysql.version ?? '—';
+
+  // ── OLA Java — data comes from healthcheck.json history (no separate services.json fetch)
+  // The gauges show the most recent history values since the JSON structure
+  // keeps full process details in services.json; history arrays in healthcheck.json.
+  const javaTitle  = document.getElementById('java-section-title');
+  const javaCpu    = (hist.java_cpu_pct   || []).slice(-1)[0] ?? null;
+  const javaMem    = (hist.java_mem_mb    || []).slice(-1)[0] ?? null;
+  const javaThr    = (hist.java_threads   || []).slice(-1)[0] ?? null;
+  const javaFds    = (hist.java_open_fds  || []).slice(-1)[0] ?? null;
+  const javaUp     = null;   // uptime not in history; shown via services.json separately
+
+  if (javaCpu === null || javaCpu === 0 && javaMem === 0 && javaThr === 0) {
+    javaTitle.innerHTML = 'OLA Java <span class="offline-badge">NOT RUNNING</span>';
+    document.getElementById('v-java-status').textContent = 'OFFLINE';
+    document.getElementById('g-java-status').className = 'card status-red';
+  } else {
+    javaTitle.innerHTML = 'OLA Java';
+    document.getElementById('v-java-status').textContent = 'RUNNING';
+    document.getElementById('g-java-status').className = 'card status-green';
+    document.getElementById('s-java-status').textContent = 'process active';
+  }
+
+  if (javaCpu !== null) {
+    document.getElementById('v-java-cpu').firstChild.textContent = javaCpu.toFixed(1);
+    setBar('b-java-cpu', javaCpu, 70, 90);
+  }
+  if (javaMem !== null) {
+    document.getElementById('v-java-mem').firstChild.textContent = javaMem.toFixed(0);
+    document.getElementById('s-java-mem').textContent = 'RSS memory';
+  }
+  if (javaThr !== null)
+    document.getElementById('v-java-thr').textContent = javaThr.toLocaleString();
+  if (javaFds !== null)
+    document.getElementById('v-java-fds').textContent = javaFds.toLocaleString();
+}
+
+function updateCharts(hist) {
+  const labels = trimLabels(hist.timestamps);
+
+  function upd(chart, ...series) {
+    chart.data.labels = labels;
+    series.forEach((s, i) => { chart.data.datasets[i].data = trimData(s); });
+    chart.update('none');
+  }
+
+  upd(charts.cpu,
+    hist.cpu_pct,
+    hist.load_1m,
+    hist.load_5m);
+
+  upd(charts.mem,
+    hist.mem_pct,
+    hist.swap_pct);
+
+  upd(charts.fd,
+    hist.open_files_kernel);
+
+  upd(charts.net,
+    hist.net_rx_mb_s.map(v => v * 8),
+    hist.net_tx_mb_s.map(v => v * 8));
+
+  upd(charts.disk,
+    hist.disk_read_mb_s,
+    hist.disk_write_mb_s);
+
+  upd(charts.mysql,
+    hist.mysql_qps,
+    hist.mysql_connections);
+
+  upd(charts.bphit,
+    hist.mysql_buf_hit_pct);
+
+  upd(charts.javaProc,
+    hist.java_cpu_pct  || [],
+    hist.java_mem_mb   || []);
+
+  upd(charts.javaThr,
+    hist.java_threads  || [],
+    hist.java_open_fds || []);
+}
+
+// ── Polling ───────────────────────────────────────────────────────────────────
+let lastTs = null;
+
+async function poll() {
+  try {
+    const resp = await fetch(JSON_URL + '?_=' + Date.now());
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const data = await resp.json();
+
+    if (data.collected_at === lastTs) return;   // no new data yet
+    lastTs = data.collected_at;
+
+    updateGauges(data);
+    updateCharts(data.history);
+
+  } catch (err) {
+    document.getElementById('status-dot').style.background = 'var(--red)';
+    document.getElementById('meta').textContent = 'ERROR: ' + err.message;
+  }
+}
+
+poll();
+setInterval(poll, REFRESH_MS);
+</script>
+</body>
+</html>
