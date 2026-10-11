@@ -4,7 +4,7 @@
 
 Runs as a systemd service on Ubuntu 24.04.
 Collects OS and MySQL/MariaDB metrics every INTERVAL seconds,
-keeps a rolling history, and writes a single JSON to /dev/shm/10mila/healthcheck.json
+keeps a rolling history, and writes a single JSON to /dev/shm/10mila-sysmon/healthcheck.json
 (atomically via a temp-file rename).
 
 Usage:  python3 collector.py [--config /etc/10mila-sysmon/config.ini]
@@ -31,9 +31,9 @@ DEFAULT_CONFIG = "/etc/10mila-sysmon/config.ini"
 
 INTERVAL       = 5          # seconds between samples
 HISTORY_SIZE   = 360        # samples kept  (360 × 5 s = 30 min)
-OUTPUT_DIR     = "/dev/shm/10mila"
+OUTPUT_DIR     = "/dev/shm/10mila-sysmon"
 OUTPUT_FILE    = "healthcheck.json"
-SYMLINK_DIR    = "/opt/OLA_6/webpages/sysmon"   # tmpfs mount — zero SSD writes
+SYMLINK_DIR    = ""         # optional second copy of the JSON (empty = disabled)
 SERVICES_FILE  = "services.json"   # compact per-service snapshot
 LSOF_ENABLED   = True       # set False if lsof is slow on this server
 HTTP_PORT      = 8082       # built-in HTTP server port (0 = disabled)
@@ -807,6 +807,8 @@ def write_json(path: str, data: dict) -> None:
 # server (including Jetty, which blocks symlinks by default) can serve it.
 
 def publish_copy(data: dict, publish_dir: str, filename: str) -> None:
+    if not publish_dir:
+        return
     try:
         os.makedirs(publish_dir, exist_ok=True)
         dest = os.path.join(publish_dir, filename)

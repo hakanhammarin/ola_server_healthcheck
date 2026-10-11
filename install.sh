@@ -8,9 +8,7 @@ set -euo pipefail
 
 INSTALL_DIR="/opt/10mila-sysmon"
 CONFIG_DIR="/etc/10mila-sysmon"
-OUTPUT_DIR="/dev/shm/10mila"
-PUBLISH_DIR="/opt/OLA_6/webpages/sysmon"   # tmpfs — served by Jetty, zero SSD writes
-SYMLINK_DIR="/opt/OLA_6/webpages/klient"   # where healthcheck.html lives
+OUTPUT_DIR="/dev/shm/10mila-sysmon"
 SERVICE_NAME="10mila-sysmon"
 SERVICE_USER="sysmon"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -33,7 +31,6 @@ if [[ "${1:-}" == "--uninstall" ]]; then
     info "Removing files..."
     rm -rf "$INSTALL_DIR"
     rm -rf "$CONFIG_DIR"
-    rm -f  "${SYMLINK_DIR}/healthcheck.json"
     userdel "$SERVICE_USER" 2>/dev/null || true
     info "Uninstall complete."
     exit 0
@@ -56,8 +53,6 @@ if ! id "$SERVICE_USER" &>/dev/null; then
     useradd --system --no-create-home --shell /usr/sbin/nologin "$SERVICE_USER"
 fi
 
-# Add to www-data so it can write into the klient symlink directory
-usermod -aG www-data "$SERVICE_USER" || true
 
 # ─── Install files ────────────────────────────────────────────────────────────
 info "Installing collector to $INSTALL_DIR ..."
@@ -83,7 +78,7 @@ interval      = 5
 history_size  = 360
 
 # Where to write the JSON (should be on tmpfs for low latency)
-output_dir    = /dev/shm/10mila
+output_dir    = /dev/shm/10mila-sysmon
 output_file   = healthcheck.json
 # Compact per-service snapshot (no history) — used by monitoring_js / statistics_js
 services_file = services.json
@@ -93,8 +88,8 @@ services_file = services.json
 # Access: http://<host>:8082/healthcheck.json  and  /services.json
 http_port     = 8082
 
-# tmpfs publish copy for Jetty (leave blank or remove to disable if using http_port).
-publish_dir   = /opt/OLA_6/webpages/sysmon
+# Optional second copy of the JSON for another web server (blank = disabled).
+publish_dir   =
 
 # Set to false if lsof is too slow on this system
 lsof_enabled  = true
@@ -145,63 +140,28 @@ fi
 # ─── Output directory (tmpfs /dev/shm) ───────────────────────────────────────
 info "Creating output directory $OUTPUT_DIR ..."
 mkdir -p "$OUTPUT_DIR"
-chown "$SERVICE_USER":www-data "$OUTPUT_DIR"
-chmod 775 "$OUTPUT_DIR"
+chown "$SERVICE_USER":"$SERVICE_USER" "$OUTPUT_DIR"
+chmod 755 "$OUTPUT_DIR"
 
 # Note: /dev/shm is cleared on reboot — the service re-creates the dir on start.
 # Persist across reboot by adding to /etc/tmpfiles.d:
 TMPFILES_CONF="/etc/tmpfiles.d/10mila-sysmon.conf"
 cat > "$TMPFILES_CONF" <<EOF
 # Created by 10mila-sysmon install.sh
-d /dev/shm/10mila 0775 $SERVICE_USER www-data -
+d /dev/shm/10mila-sysmon 0755 $SERVICE_USER $SERVICE_USER -
 EOF
 info "Registered tmpfiles.d entry: $TMPFILES_CONF"
-
-# ─── Publish directory — tmpfs (zero SSD writes) ────────────────────────────
-# A small tmpfs is mounted at $PUBLISH_DIR so Jetty serves the JSON entirely
-# from RAM. The mount is registered in /etc/fstab to survive reboots.
-info "Setting up tmpfs publish directory at $PUBLISH_DIR ..."
-mkdir -p "$PUBLISH_DIR"
-chown "$SERVICE_USER":www-data "$PUBLISH_DIR"
-chmod 755 "$PUBLISH_DIR"
-
-# Mount tmpfs now (skip if already mounted)
-if ! mountpoint -q "$PUBLISH_DIR"; then
-    mount -t tmpfs -o size=2M,mode=755,uid=$(id -u "$SERVICE_USER"),gid=$(getent group www-data | cut -d: -f3) tmpfs "$PUBLISH_DIR"
-    info "tmpfs mounted at $PUBLISH_DIR"
-fi
-
-# Register in /etc/fstab for reboot persistence (add only if not already there)
-FSTAB_ENTRY="tmpfs  $PUBLISH_DIR  tmpfs  size=2M,mode=755,uid=$(id -u "$SERVICE_USER"),gid=$(getent group www-data | cut -d: -f3)  0  0"
-if ! grep -qF "$PUBLISH_DIR" /etc/fstab; then
-    echo "$FSTAB_ENTRY" >> /etc/fstab
-    info "Added tmpfs entry to /etc/fstab"
-fi
-
-# Update publish_dir in config
-sed -i "s|^publish_dir.*|publish_dir   = $PUBLISH_DIR|" "$CONFIG_FILE" 2>/dev/null || true
-
-# Remove any old file from previous installs
-rm -f "${SYMLINK_DIR}/healthcheck.json"
 
 # ─── Install HTML dashboard ───────────────────────────────────────────────────
 if [[ -f "$SCRIPT_DIR/healthcheck.html" ]]; then
     # Copy to the built-in HTTP server root (tmpfs, re-created on each install/reboot).
     # /etc/tmpfiles.d ensures the directory exists after reboot; the service
     # recreates it too, but the HTML must be installed again after a reboot.
-    # A persistent copy lives in SYMLINK_DIR for Jetty-based access.
     info "Copying healthcheck.html to $OUTPUT_DIR ..."
     mkdir -p "$OUTPUT_DIR"
     cp "$SCRIPT_DIR/healthcheck.html" "$OUTPUT_DIR/"
-    chown "$SERVICE_USER":www-data "$OUTPUT_DIR/healthcheck.html"
+    chown "$SERVICE_USER":"$SERVICE_USER" "$OUTPUT_DIR/healthcheck.html"
     chmod 644 "$OUTPUT_DIR/healthcheck.html"
-
-    if [[ -d "$SYMLINK_DIR" ]]; then
-        info "Copying healthcheck.html to $SYMLINK_DIR (Jetty fallback) ..."
-        cp "$SCRIPT_DIR/healthcheck.html" "$SYMLINK_DIR/"
-        chown root:www-data "$SYMLINK_DIR/healthcheck.html"
-        chmod 644 "$SYMLINK_DIR/healthcheck.html"
-    fi
 fi
 
 # ─── systemd service ─────────────────────────────────────────────────────────
@@ -216,13 +176,12 @@ if systemctl is-active --quiet "$SERVICE_NAME"; then
     info "Service is running."
     echo
     info "Output:   $OUTPUT_DIR/healthcheck.json"
-    info "Symlink:  $SYMLINK_DIR/healthcheck.json → $OUTPUT_DIR/healthcheck.json"
-    info "Dashboard: http://192.168.1.21:8081/klient/healthcheck.html"
+    info "Dashboard: http://$(hostname -I | awk '{print $1}'):8082/healthcheck.html"
     echo
     info "Useful commands:"
     echo "    journalctl -u $SERVICE_NAME -f          # live logs"
     echo "    systemctl status $SERVICE_NAME           # status"
-    echo "    cat /dev/shm/10mila/healthcheck.json | python3 -m json.tool | head -60"
+    echo "    cat /dev/shm/10mila-sysmon/healthcheck.json | python3 -m json.tool | head -60"
 else
     warn "Service did not start — check logs:"
     echo "    journalctl -u $SERVICE_NAME -n 30 --no-pager"

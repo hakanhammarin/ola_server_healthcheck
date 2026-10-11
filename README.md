@@ -1,7 +1,7 @@
 # 10mila System Monitor
 
-A lightweight OS + MySQL/MariaDB health monitoring daemon for Ubuntu 24.04 LTS.
-Metrics are collected every 5 seconds, stored in RAM (`/dev/shm`), and served via Jetty with zero SSD writes.
+A lightweight OS + MySQL/MariaDB health monitoring daemon for Ubuntu 24.04 LTS and Amazon Linux 2023.
+Metrics are collected every 5 seconds, stored in RAM (`/dev/shm`), and served by the collector's own built-in HTTP server on port 8082 with zero SSD writes. It does not depend on OLA, Jetty or a web server group.
 
 ## Files
 
@@ -10,7 +10,7 @@ Metrics are collected every 5 seconds, stored in RAM (`/dev/shm`), and served vi
 | `install.sh` | Automated install / uninstall script (run as root) |
 | `collector.py` | Python 3 daemon — collects metrics and writes JSON |
 | `10mila-sysmon.service` | systemd unit file |
-| `healthcheck.html` | Chart.js live dashboard (copy to Jetty webroot) |
+| `healthcheck.html` | Chart.js live dashboard (served on port 8082) |
 
 ## Requirements
 
@@ -31,11 +31,9 @@ The script will:
 2. Install `collector.py` to `/opt/10mila-sysmon/`
 3. Write default config to `/etc/10mila-sysmon/config.ini`
 4. Write MySQL credentials template to `/etc/10mila-sysmon/mysql.cnf`
-5. Create `/dev/shm/10mila/` (tmpfs, primary JSON output)
-6. Mount a 2 MB tmpfs at `/opt/OLA_6/webpages/sysmon/` (Jetty-served copy, zero SSD writes)
-7. Add both mounts to `/etc/fstab` and `/etc/tmpfiles.d/` for reboot persistence
-8. Copy `healthcheck.html` to `/opt/OLA_6/webpages/klient/`
-9. Install and start the systemd service
+5. Create `/dev/shm/10mila-sysmon/` (tmpfs, primary JSON output)
+6. Register `/dev/shm/10mila-sysmon` in `/etc/tmpfiles.d/` so it exists after a reboot
+7. Install and start the systemd service
 
 ## Uninstall
 
@@ -55,7 +53,7 @@ FLUSH PRIVILEGES;
 
 ## Built-in HTTP server
 
-The collector embeds a lightweight HTTP server (Python `http.server`, stdlib-only) that serves all JSON files and `healthcheck.html` directly from `/dev/shm/10mila/`.
+The collector embeds a lightweight HTTP server (Python `http.server`, stdlib-only) that serves all JSON files and `healthcheck.html` directly from `/dev/shm/10mila-sysmon/`.
 
 | URL | Content |
 |---|---|
@@ -65,20 +63,18 @@ The collector embeds a lightweight HTTP server (Python `http.server`, stdlib-onl
 
 No dependency on Jetty/Java. Port is configurable in `/etc/10mila-sysmon/config.ini` (`http_port = 8082`). Set to `0` to disable.
 
-> `/dev/shm/10mila/healthcheck.html` is cleared on reboot, but the service automatically copies it from `/opt/10mila-sysmon/healthcheck.html` (installed by `install.sh`) on every start via `ExecStartPre`. The copy is non-fatal — if the source is missing the service still starts.
+> `/dev/shm/10mila-sysmon/healthcheck.html` is cleared on reboot, but the service automatically copies it from `/opt/10mila-sysmon/healthcheck.html` (installed by `install.sh`) on every start via `ExecStartPre`. The copy is non-fatal — if the source is missing the service still starts.
 
 ## File locations
 
 | Path | Description |
 |---|---|
-| `/dev/shm/10mila/healthcheck.json` | Primary JSON output (tmpfs, in RAM) |
-| `/opt/OLA_6/webpages/sysmon/healthcheck.json` | Jetty-served copy (tmpfs mount, in RAM) |
-| `/opt/OLA_6/webpages/klient/healthcheck.html` | Dashboard served by Jetty |
+| `/dev/shm/10mila-sysmon/healthcheck.json` | Primary JSON output (tmpfs, in RAM) |
 | `/etc/10mila-sysmon/config.ini` | Collector configuration |
 | `/etc/10mila-sysmon/mysql.cnf` | MySQL credentials (chmod 640, root:sysmon) |
 | `/opt/10mila-sysmon/collector.py` | Collector script |
 
-Dashboard URL: `http://192.168.1.21:8081/klient/healthcheck.html`
+Dashboard URL: `http://<server>:8082/healthcheck.html`
 
 ## Metrics collected
 
@@ -110,7 +106,7 @@ journalctl -u 10mila-sysmon -f
 systemctl status 10mila-sysmon
 
 # Inspect latest JSON
-cat /dev/shm/10mila/healthcheck.json | python3 -m json.tool | head -60
+cat /dev/shm/10mila-sysmon/healthcheck.json | python3 -m json.tool | head -60
 
 # Check tmpfs mounts
 mount | grep sysmon
@@ -126,21 +122,9 @@ sed -i 's/\r$//' install.sh collector.py 10mila-sysmon.service
 **"Read-only file system" warning in logs**
 The service uses `ProtectSystem=strict`. Ensure all writable paths are listed in `ReadWritePaths` inside `10mila-sysmon.service`:
 ```ini
-ReadWritePaths=/dev/shm/10mila /opt/OLA_6/webpages/klient /opt/OLA_6/webpages/sysmon
+ReadWritePaths=/dev/shm/10mila-sysmon
 ```
 After any service file change: `sudo systemctl daemon-reload && sudo systemctl restart 10mila-sysmon`
-
-**Stacked tmpfs mounts** (if `install.sh` was run multiple times):
-```bash
-# Check how many are stacked
-mount | grep sysmon
-
-# Unmount extras (run once per extra mount)
-sudo umount /opt/OLA_6/webpages/sysmon
-
-# Remove duplicate fstab entries
-sudo awk '!seen[$0]++' /etc/fstab | sudo tee /etc/fstab.tmp && sudo mv /etc/fstab.tmp /etc/fstab
-```
 
 **MySQL offline badge shown**
 Check credentials in `/etc/10mila-sysmon/mysql.cnf` and that the `sysmon` MySQL user exists with `PROCESS` and `REPLICATION CLIENT` grants.
