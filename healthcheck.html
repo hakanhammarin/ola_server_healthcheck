@@ -186,6 +186,11 @@
       <div class="card-sub"  id="s-fd">— % of max</div>
       <div class="bar-bg"><div class="bar-fill" id="b-fd" style="width:0%"></div></div>
     </div>
+    <div class="card" id="g-tunnel">
+      <div class="card-label">SSH tunnel</div>
+      <div class="card-value" id="v-tunnel">—</div>
+      <div class="card-sub"  id="s-tunnel">TCP probe —</div>
+    </div>
   </div>
 
   <!-- MySQL gauges -->
@@ -260,6 +265,42 @@
     </div>
   </div>
 
+  <!-- NGINX + PHP-FPM gauges (shown only when nginx is running on this server) -->
+  <div class="section-title web-only" id="web-section-title" style="display:none">NGINX / PHP-FPM</div>
+  <div class="gauges web-only" id="web-gauges" style="display:none">
+    <div class="card" id="g-ng-conn">
+      <div class="card-label">NGINX connections</div>
+      <div class="card-value" id="v-ng-conn">—</div>
+      <div class="card-sub"  id="s-ng-conn">reading — · writing — · waiting —</div>
+    </div>
+    <div class="card" id="g-ng-rps">
+      <div class="card-label">NGINX requests/s</div>
+      <div class="card-value" id="v-ng-rps">—</div>
+      <div class="card-sub"  id="s-ng-rps">accepts/s — · dropped —</div>
+    </div>
+    <div class="card" id="g-fpm-proc">
+      <div class="card-label">PHP-FPM processes</div>
+      <div class="card-value" id="v-fpm-proc">—</div>
+      <div class="card-sub"  id="s-fpm-proc">active — · idle —</div>
+      <div class="bar-bg"><div class="bar-fill" id="b-fpm-proc" style="width:0%"></div></div>
+    </div>
+    <div class="card" id="g-fpm-queue">
+      <div class="card-label">PHP-FPM queue</div>
+      <div class="card-value" id="v-fpm-queue">—</div>
+      <div class="card-sub"  id="s-fpm-queue">max — · limit —</div>
+    </div>
+    <div class="card" id="g-fpm-rps">
+      <div class="card-label">PHP-FPM requests/s</div>
+      <div class="card-value" id="v-fpm-rps">—</div>
+      <div class="card-sub"  id="s-fpm-rps">slow requests —</div>
+    </div>
+    <div class="card" id="g-fpm-max">
+      <div class="card-label">Max children reached</div>
+      <div class="card-value" id="v-fpm-max">—</div>
+      <div class="card-sub"  id="s-fpm-max">pool —</div>
+    </div>
+  </div>
+
   <!-- Graphs -->
   <div class="section-title">Graphs (last 30 min)</div>
   <div class="charts">
@@ -298,6 +339,18 @@
     <div class="chart-card">
       <div class="chart-title">OLA Java — Threads &amp; Open FDs</div>
       <canvas id="ch-java-thr" height="120"></canvas>
+    </div>
+    <div class="chart-card">
+      <div class="chart-title">SSH tunnel — TCP round trip (ms)</div>
+      <canvas id="ch-tunnel" height="120"></canvas>
+    </div>
+    <div class="chart-card web-only" style="display:none">
+      <div class="chart-title">NGINX — Connections &amp; Requests/s</div>
+      <canvas id="ch-nginx" height="120"></canvas>
+    </div>
+    <div class="chart-card web-only" style="display:none">
+      <div class="chart-title">PHP-FPM — Processes, Queue &amp; Requests/s</div>
+      <canvas id="ch-fpm" height="120"></canvas>
     </div>
   </div>
 </main>
@@ -433,6 +486,17 @@ const C = {
   jmem:   '#e67700',  // amber
   jthr:   '#364fc7',  // indigo
   jfds:   '#0b7285',  // dark teal
+  // SSH tunnel
+  trtt:   '#1971c2',  // blue
+  tdown:  '#cf222e',  // red
+  // NGINX + PHP-FPM
+  ngact:  '#087f5b',  // emerald
+  ngwait: '#868e96',  // grey
+  ngrps:  '#e67700',  // orange
+  fpmact: '#7048e8',  // violet
+  fpmidl: '#868e96',  // grey
+  fpmq:   '#c92a2a',  // red
+  fpmrps: '#e67700',  // orange
 };
 
 const charts = {
@@ -479,7 +543,36 @@ const charts = {
     { label: 'Threads',  borderColor: C.jthr },
     { label: 'Open FDs', borderColor: C.jfds },
   ], 'count'),
+  tunnel: makeChart('ch-tunnel', [
+    { label: 'Round trip (ms)', borderColor: C.trtt },
+    { label: 'Down', borderColor: C.tdown, backgroundColor: 'rgba(207,34,46,.18)', fill: true, stepped: true, yAxisID: 'yDown' },
+  ], 'ms'),
+  nginx: makeChart('ch-nginx', [
+    { label: 'Active',     borderColor: C.ngact, yAxisID: 'y' },
+    { label: 'Waiting',    borderColor: C.ngwait, yAxisID: 'y' },
+    { label: 'Requests/s', borderColor: C.ngrps, yAxisID: 'y1' },
+  ], null),
+  fpm: makeChart('ch-fpm', [
+    { label: 'Active',       borderColor: C.fpmact, yAxisID: 'y' },
+    { label: 'Idle',         borderColor: C.fpmidl, yAxisID: 'y' },
+    { label: 'Listen queue', borderColor: C.fpmq, yAxisID: 'y' },
+    { label: 'Requests/s',   borderColor: C.fpmrps, yAxisID: 'y1' },
+  ], null),
 };
+
+// Requests/s on a right-hand axis for the two web charts
+for (const c of [charts.nginx, charts.fpm]) {
+  c.options.scales.y1 = {
+    type: 'linear', position: 'right', beginAtZero: true,
+    grid: { drawOnChartArea: false }, ticks: { maxTicksLimit: 5 },
+    title: { display: true, text: 'req/s', font: { size: 10 } },
+  };
+  c.update();
+}
+
+// SSH tunnel chart: a failed probe leaves a gap in the line and a red band behind it
+charts.tunnel.options.scales.yDown = { display: false, min: 0, max: 1 };
+charts.tunnel.update();
 
 // Second Y-axis for MySQL chart (connections on right)
 charts.mysql.options.scales.y1 = {
@@ -631,6 +724,64 @@ function updateGauges(d) {
     document.getElementById('v-java-fds').textContent = javaFds.toLocaleString();
 }
 
+// SSH tunnel status box (System row). d.ssh_tunnel comes from the collector's TCP probe.
+function updateTunnel(t) {
+  const card = document.getElementById('g-tunnel');
+  const val  = document.getElementById('v-tunnel');
+  const sub  = document.getElementById('s-tunnel');
+  if (!t || (!t.probe_enabled && !t.process_running)) {
+    card.className = 'card'; val.textContent = 'n/a'; val.style.color = 'var(--muted)';
+    sub.textContent = 'no tunnel on this server';
+    return;
+  }
+  const up = !!t.available;
+  card.className = 'card ' + (up ? 'status-green' : 'status-red');
+  val.textContent = up ? 'UP' : 'DOWN';
+  val.style.color = up ? 'var(--green)' : 'var(--red)';
+  if (t.probe_enabled) {
+    sub.textContent = up ? `round trip ${t.rtt_ms} ms · ${t.probe_target}`
+                         : `probe failed: ${t.probe_error || 'no answer'} · ${t.probe_target}`;
+  } else {
+    sub.textContent = up ? 'process running (no TCP probe configured)' : 'process or monitor port missing';
+  }
+}
+
+// NGINX + PHP-FPM (d.web from the collector's local polling). The whole section is hidden
+// on servers where nginx is not running.
+function updateWeb(w) {
+  const show = !!(w && w.nginx_running);
+  document.querySelectorAll('.web-only').forEach(el => { el.style.display = show ? '' : 'none'; });
+  if (!show) return;
+  const txt = (id, v) => { document.getElementById(id).textContent = v; };
+  const num = v => (v === null || v === undefined) ? '—' : v.toLocaleString();
+  const ng = w.nginx || {}, fpm = w.fpm || {};
+
+  const missing = [];
+  if (!ng.available)  missing.push('NGINX status page not answering');
+  if (!fpm.available) missing.push('PHP-FPM status page not answering');
+  document.getElementById('web-section-title').innerHTML = 'NGINX / PHP-FPM' +
+    missing.map(m => ` <span class="offline-badge">${m.toUpperCase()}</span>`).join('');
+
+  txt('v-ng-conn', num(ng.active_connections));
+  txt('s-ng-conn', `reading ${num(ng.reading)} · writing ${num(ng.writing)} · waiting ${num(ng.waiting)}`);
+  txt('v-ng-rps',  num(ng.requests_s));
+  txt('s-ng-rps',  `accepts/s ${num(ng.accepts_s)} · dropped ${num(ng.dropped)}`);
+  document.getElementById('g-ng-rps').className = 'card' + (ng.dropped > 0 ? ' status-red' : '');
+
+  txt('v-fpm-proc', fpm.available ? `${num(fpm.active_processes)} / ${num(fpm.total_processes)}` : '—');
+  txt('s-fpm-proc', `active ${num(fpm.active_processes)} · idle ${num(fpm.idle_processes)} · peak ${num(fpm.max_active_processes)}`);
+  if (fpm.available && fpm.total_processes > 0)
+    setBar('b-fpm-proc', fpm.active_processes / fpm.total_processes * 100, 70, 90);
+  txt('v-fpm-queue', num(fpm.listen_queue));
+  txt('s-fpm-queue', `max ${num(fpm.max_listen_queue)} · limit ${num(fpm.listen_queue_len)}`);
+  document.getElementById('g-fpm-queue').className = 'card' + (fpm.listen_queue > 0 ? ' status-red' : '');
+  txt('v-fpm-rps',  num(fpm.requests_s));
+  txt('s-fpm-rps',  `slow requests ${num(fpm.slow_requests)}`);
+  txt('v-fpm-max',  num(fpm.max_children_reached));
+  txt('s-fpm-max',  `pool ${fpm.pool ?? '—'} (${fpm.process_manager ?? '—'})`);
+  document.getElementById('g-fpm-max').className = 'card' + (fpm.max_children_reached > 0 ? ' status-red' : '');
+}
+
 function updateCharts(hist) {
   const labels = trimLabels(hist.timestamps);
 
@@ -674,6 +825,18 @@ function updateCharts(hist) {
   upd(charts.javaThr,
     hist.java_threads  || [],
     hist.java_open_fds || []);
+  upd(charts.tunnel,
+    hist.tunnel_rtt_ms || [],
+    (hist.tunnel_up || []).map(v => (v === 0 ? 1 : 0)));
+  upd(charts.nginx,
+    hist.nginx_active  || [],
+    hist.nginx_waiting || [],
+    hist.nginx_rps     || []);
+  upd(charts.fpm,
+    hist.fpm_active || [],
+    hist.fpm_idle   || [],
+    hist.fpm_queue  || [],
+    hist.fpm_rps    || []);
 }
 
 // ── Polling ───────────────────────────────────────────────────────────────────
@@ -689,6 +852,8 @@ async function poll() {
     lastTs = data.collected_at;
 
     updateGauges(data);
+    updateTunnel(data.ssh_tunnel);
+    updateWeb(data.web);
     updateCharts(data.history);
 
   } catch (err) {

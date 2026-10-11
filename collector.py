@@ -16,11 +16,13 @@ import http.server
 import json
 import os
 import re
+import socket
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import urllib.request
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
@@ -521,7 +523,7 @@ class TunnelMonitor:
     """
     Checks the SSH reverse tunnel managed by autossh.
 
-    Two independent checks:
+    Three checks:
 
     1. Process — is autossh (or the ssh_reverse_tunnel script) running?
        Scanned from /proc/*/cmdline, no external tools needed.
@@ -532,12 +534,40 @@ class TunnelMonitor:
        to the SSH command, which creates a TCP LISTEN socket on that port.
        If the tunnel drops, SSH exits and the socket disappears.
        We read /proc/net/tcp[6] to check — no socket(), no subprocess.
+
+    3. TCP probe (optional) — open a TCP connection to probe_host:probe_port and
+       wait for the first byte the far end sends (MySQL and sshd both greet
+       first). The time from connect() to that byte is the round trip.
+       Pointed at a local port that ssh forwards to the tunnel's remote
+       listening port (-L probe_port:127.0.0.1:<remote_port>), the connection
+       travels to the remote host, into the reverse tunnel and back to this
+       machine's MySQL — a real end-to-end test of the tunnel.
     """
 
     def __init__(self, monitor_port: int = 20000,
-                 service_name: str = "ssh_reverse_tunnel") -> None:
+                 service_name: str = "ssh_reverse_tunnel",
+                 probe_host: str = "127.0.0.1", probe_port: int = 0,
+                 probe_timeout: float = 3.0) -> None:
         self._port         = monitor_port
         self._service_name = service_name
+        self._probe_host   = probe_host
+        self._probe_port   = probe_port      # 0 = probe disabled
+        self._probe_timeout = probe_timeout
+
+    def _probe(self) -> "tuple[bool, float | None, str]":
+        """TCP round trip: connect, then wait for the far end's first byte."""
+        t0 = time.monotonic()
+        try:
+            with socket.create_connection((self._probe_host, self._probe_port),
+                                          timeout=self._probe_timeout) as sock:
+                sock.settimeout(self._probe_timeout)
+                if not sock.recv(1):
+                    return False, None, "closed without greeting"
+            return True, round((time.monotonic() - t0) * 1000, 1), ""
+        except socket.timeout:
+            return False, None, "timeout"
+        except OSError as e:
+            return False, None, e.strerror or str(e)
 
     def _find_pid(self) -> "int | None":
         try:
@@ -580,13 +610,134 @@ class TunnelMonitor:
         # Tunnel is considered UP only when the process is running AND
         # the monitor port LISTEN socket exists.
         tunnel_up  = pid is not None and port_up
-        return {
-            "available":       tunnel_up,
+        out = {
             "process_running": pid is not None,
             "pid":             pid,
             "monitor_port":    self._port,
             "monitor_port_ok": port_up,
+            "probe_enabled":   self._probe_port > 0,
         }
+        if self._probe_port > 0:
+            ok, rtt, err = self._probe()
+            out.update({"probe_target": f"{self._probe_host}:{self._probe_port}",
+                        "probe_ok": ok, "rtt_ms": rtt, "probe_error": err})
+            # With a probe configured, the probe decides: it tests the whole path.
+            tunnel_up = ok
+        out["available"] = tunnel_up
+        return out
+
+
+# ─── NGINX + PHP-FPM ─────────────────────────────────────────────────────────
+
+def parse_nginx_status(text: str) -> dict:
+    """Parse the nginx stub_status page."""
+    out: dict = {}
+    m = re.search(r"Active connections:\s+(\d+)", text)
+    if m:
+        out["active_connections"] = int(m.group(1))
+    m = re.search(r"server accepts handled requests\s+(\d+)\s+(\d+)\s+(\d+)", text)
+    if m:
+        out["accepts"], out["handled"], out["requests"] = (int(g) for g in m.groups())
+    m = re.search(r"Reading:\s+(\d+)\s+Writing:\s+(\d+)\s+Waiting:\s+(\d+)", text)
+    if m:
+        out["reading"], out["writing"], out["waiting"] = (int(g) for g in m.groups())
+    return out
+
+
+def parse_fpm_status(text: str) -> dict:
+    """Parse the PHP-FPM status page ("key name:   value" lines); keys get underscores."""
+    out: dict = {}
+    for line in text.splitlines():
+        m = re.match(r"^([^:]+):\s+(.+)$", line)
+        if not m:
+            continue
+        raw = m.group(2).strip()
+        out[re.sub(r"\s+", "_", m.group(1).strip())] = int(raw) if raw.isdigit() else raw
+    return out
+
+
+class WebMonitor:
+    """
+    NGINX and PHP-FPM statistics, polled on this machine.
+
+    Nothing is polled unless an nginx process is running, so servers without a
+    web server pay nothing and show no web section. With nginx running:
+
+    - nginx_url — the stub_status page (connections, accepts, requests)
+    - fpm_url   — the PHP-FPM status page (pm.status_path: processes, queue)
+
+    Both are expected on a loopback-only listener. Per-second rates are the
+    difference of the cumulative counters between two samples.
+    """
+
+    def __init__(self, nginx_url: str, fpm_url: str, timeout: float = 2.0) -> None:
+        self._nginx_url = nginx_url
+        self._fpm_url   = fpm_url
+        self._timeout   = timeout
+        self._prev: dict[str, tuple[int, float]] = {}   # counter → (value, time)
+        # Never through a proxy: the status pages are local.
+        self._opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+    @staticmethod
+    def _nginx_running() -> bool:
+        try:
+            for entry in Path("/proc").iterdir():
+                if entry.name.isdigit():
+                    try:
+                        if (entry / "comm").read_text().strip() == "nginx":
+                            return True
+                    except OSError:
+                        continue
+        except OSError:
+            pass
+        return False
+
+    def _fetch(self, url: str) -> "str | None":
+        if not url:
+            return None
+        try:
+            with self._opener.open(url, timeout=self._timeout) as r:
+                return r.read(65536).decode("utf-8", "replace")
+        except (OSError, ValueError):
+            return None
+
+    def _rate(self, name: str, value: "int | None", now: float) -> "float | None":
+        """Per-second rate of a cumulative counter; None on the first sample or after a restart."""
+        if value is None:
+            self._prev.pop(name, None)
+            return None
+        prev = self._prev.get(name)
+        self._prev[name] = (value, now)
+        if prev is None or value < prev[0]:
+            return None
+        return round((value - prev[0]) / max(now - prev[1], 1e-9), 1)
+
+    def sample(self) -> dict:
+        # Both URLs empty = switched off (e.g. a server whose nginx is not in use).
+        if not (self._nginx_url or self._fpm_url) or not self._nginx_running():
+            self._prev.clear()
+            return {"nginx_running": False}
+
+        now = time.monotonic()
+        out: dict = {"nginx_running": True, "nginx": {"available": False}, "fpm": {"available": False}}
+
+        text = self._fetch(self._nginx_url)
+        ng = parse_nginx_status(text) if text else {}
+        if "active_connections" in ng:
+            ng["available"]  = True
+            ng["requests_s"] = self._rate("nginx_requests", ng.get("requests"), now)
+            ng["accepts_s"]  = self._rate("nginx_accepts",  ng.get("accepts"),  now)
+            ng["dropped"]    = ng.get("accepts", 0) - ng.get("handled", 0)
+            out["nginx"] = ng
+
+        text = self._fetch(self._fpm_url)
+        fpm = parse_fpm_status(text) if text else {}
+        if "active_processes" in fpm:
+            fpm["available"]  = True
+            fpm["requests_s"] = self._rate("fpm_accepted", fpm.get("accepted_conn"), now)
+            out["fpm"] = fpm
+
+        return out
 
 
 # ─── MySQL / MariaDB ─────────────────────────────────────────────────────────
@@ -725,6 +876,11 @@ HISTORY_KEYS = [
     "mysql_qps", "mysql_connections", "mysql_buf_hit_pct",
     # OLA Java process metrics (from /proc — no JMX needed)
     "java_cpu_pct", "java_mem_mb", "java_threads", "java_open_fds",
+    # SSH tunnel TCP probe: round trip in ms (None when the probe failed) and up/down as 1/0
+    "tunnel_rtt_ms", "tunnel_up",
+    # NGINX + PHP-FPM (None while nginx is not running or a status page does not answer)
+    "nginx_active", "nginx_waiting", "nginx_rps",
+    "fpm_active", "fpm_idle", "fpm_queue", "fpm_rps",
 ]
 
 
@@ -735,8 +891,10 @@ def empty_history(size: int) -> dict[str, deque]:
 def restore_history(data: dict, size: int) -> dict[str, deque]:
     h = empty_history(size)
     src = data.get("history", {})
+    n = len(src.get("timestamps", []))
     for k in HISTORY_KEYS:
-        for v in src.get(k, []):
+        # A series that is new since the JSON was written is padded, so all series keep the same length.
+        for v in src.get(k, [None] * n):
             h[k].append(v)
     return h
 
@@ -776,6 +934,21 @@ def push_history(h: dict[str, deque], snapshot: dict,
     h["java_mem_mb"].append(   java.get("mem_mb",    0) if java.get("available") else 0)
     h["java_threads"].append(  java.get("threads",   0) if java.get("available") else 0)
     h["java_open_fds"].append( java.get("open_fds",  0) if java.get("available") else 0)
+
+    tunnel = snapshot.get("ssh_tunnel", {})
+    h["tunnel_rtt_ms"].append(tunnel.get("rtt_ms"))
+    h["tunnel_up"].append(1 if tunnel.get("available") else 0)
+
+    web = snapshot.get("web", {})
+    ng  = web.get("nginx", {})
+    fpm = web.get("fpm", {})
+    h["nginx_active"].append( ng.get("active_connections"))
+    h["nginx_waiting"].append(ng.get("waiting"))
+    h["nginx_rps"].append(    ng.get("requests_s"))
+    h["fpm_active"].append(   fpm.get("active_processes"))
+    h["fpm_idle"].append(     fpm.get("idle_processes"))
+    h["fpm_queue"].append(    fpm.get("listen_queue"))
+    h["fpm_rps"].append(      fpm.get("requests_s"))
 
 
 def serialise_history(h: dict[str, deque]) -> dict:
@@ -838,10 +1011,35 @@ def load_config(path: str) -> configparser.ConfigParser:
 
 # ─── Main loop ────────────────────────────────────────────────────────────────
 
+def selftest() -> None:
+    """python3 collector.py --selftest — the status page parsers, on real sample pages."""
+    ng = parse_nginx_status("Active connections: 291 \nserver accepts handled requests\n"
+                            " 16630948 16630946 31070465 \nReading: 6 Writing: 179 Waiting: 106 \n")
+    assert ng == {"active_connections": 291, "accepts": 16630948, "handled": 16630946,
+                  "requests": 31070465, "reading": 6, "writing": 179, "waiting": 106}, ng
+    fpm = parse_fpm_status("pool:                 www\nprocess manager:      dynamic\n"
+                           "start time:           11/Oct/2026:20:00:00 +0200\naccepted conn:        1234\n"
+                           "listen queue:         0\nmax listen queue:     7\nidle processes:       4\n"
+                           "active processes:     1\ntotal processes:      5\nmax children reached: 0\n")
+    assert fpm["pool"] == "www" and fpm["accepted_conn"] == 1234 and fpm["max_listen_queue"] == 7, fpm
+    assert fpm["active_processes"] == 1 and fpm["start_time"].startswith("11/Oct"), fpm
+    w = WebMonitor("", "")
+    assert w.sample() == {"nginx_running": False}   # no URLs: off, whatever is running
+    assert w._rate("c", 100, 10.0) is None and w._rate("c", 150, 15.0) == 10.0
+    assert w._rate("c", 5, 20.0) is None            # counter went backwards: service restarted
+    h = restore_history({"history": {"timestamps": ["a", "b"], "cpu_pct": [1, 2]}}, 10)
+    assert list(h["nginx_rps"]) == [None, None] and list(h["cpu_pct"]) == [1, 2]
+    print("selftest ok")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="10mila system + MySQL monitor")
     parser.add_argument("--config", default=DEFAULT_CONFIG)
+    parser.add_argument("--selftest", action="store_true", help="check the parsers and exit")
     args = parser.parse_args()
+    if args.selftest:
+        selftest()
+        return
 
     cfg = load_config(args.config)
 
@@ -859,11 +1057,15 @@ def main() -> None:
     mysql_port   = cfg.get   ("mysql",    "port",         fallback=MYSQL_PORT)
     tunnel_port  = cfg.getint("tunnel",   "monitor_port", fallback=20000)
     tunnel_svc   = cfg.get   ("tunnel",   "service_name", fallback="ssh_reverse_tunnel")
+    probe_host   = cfg.get   ("tunnel",   "probe_host",   fallback="127.0.0.1")
+    probe_port   = cfg.getint("tunnel",   "probe_port",   fallback=0)
+    probe_timeout = cfg.getfloat("tunnel", "probe_timeout_s", fallback=3.0)
+    nginx_url    = cfg.get   ("web",      "nginx_url",    fallback="http://127.0.0.1:8080/nginx_status")
+    fpm_url      = cfg.get   ("web",      "fpm_url",      fallback="http://127.0.0.1:8080/fpm_status")
 
     output_path  = os.path.join(output_dir, output_file)
     link_name    = output_file
 
-    import socket
     hostname = socket.gethostname()
 
     print(f"[sysmon] starting — interval={interval}s  history={history_size}  output={output_path}", flush=True)
@@ -878,7 +1080,8 @@ def main() -> None:
     net_mon  = NetMonitor()
     db_mon     = MySQLMonitor(mysql_cfg, mysql_host, mysql_port)
     proc_mon   = ProcessMonitor()
-    tunnel_mon = TunnelMonitor(tunnel_port, tunnel_svc)
+    tunnel_mon = TunnelMonitor(tunnel_port, tunnel_svc, probe_host, probe_port, probe_timeout)
+    web_mon    = WebMonitor(nginx_url, fpm_url)
 
     # Restore history from existing JSON (keeps graphs continuous on restart)
     history = empty_history(history_size)
@@ -927,6 +1130,8 @@ def main() -> None:
                 },
             },
             "mysql": db_mon.sample(),
+            "ssh_tunnel": tunnel_mon.sample(),
+            "web": web_mon.sample(),
         }
 
         # Sample processes here so Java metrics flow into history AND services
@@ -967,7 +1172,8 @@ def main() -> None:
                     "mounts": snapshot["current"].get("disk_space", []),
                 },
                 "ola_java":    processes.get("ola_java", {"available": False}),
-                "ssh_tunnel":  tunnel_mon.sample(),
+                "ssh_tunnel":  snapshot["ssh_tunnel"],
+                "web":         snapshot["web"],
             },
         }
 

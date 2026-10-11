@@ -94,6 +94,36 @@ Dashboard URL: `http://<server>:8082/healthcheck.html`
 - Slow queries, open tables
 - DB traffic bytes sent/received
 
+**SSH tunnel** (when `probe_port` is set in `[tunnel]`)
+- Status box in the System row: UP / DOWN from a TCP probe through the tunnel
+- Round trip of the probe in ms, as a graph; failed probes show as a red band
+
+The probe connects to `probe_host:probe_port` and waits for the far end's first byte.
+Point it at a local port that ssh forwards to the tunnel's remote listening port
+(`-L 127.0.0.1:33316:127.0.0.1:33306`), so the test goes out to the remote host and back
+through the reverse tunnel.
+
+**NGINX / PHP-FPM** (only while an nginx process is running on the server)
+- NGINX: active connections, reading / writing / waiting, requests/s, accepts/s, dropped connections
+- PHP-FPM: active / idle / total processes, listen queue, requests/s, slow requests, max children reached
+
+The collector polls two local status pages, set in `[web]` in `config.ini`
+(defaults `http://127.0.0.1:8080/nginx_status` and `http://127.0.0.1:8080/fpm_status`).
+They must exist on the web server, on a loopback-only listener:
+
+```nginx
+server {
+    listen 127.0.0.1:8080;
+    location = /nginx_status { stub_status; }
+    location = /fpm_status   { include fastcgi_params; fastcgi_param SCRIPT_NAME /fpm_status;
+                               fastcgi_param SCRIPT_FILENAME /fpm_status; fastcgi_pass php-fpm; }
+}
+```
+
+and in the PHP-FPM pool: `pm.status_path = /fpm_status`.
+
+Check the parsers: `python3 collector.py --selftest`.
+
 History: 360 samples × 5 s interval = 30 minutes of rolling history.
 
 ## Useful commands

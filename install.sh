@@ -106,6 +106,20 @@ port          = 3306
 # The collector checks /proc/net/tcp for that socket — no external tools needed.
 monitor_port  = 20000
 service_name  = ssh_reverse_tunnel
+# TCP probe of the tunnel, shown as the "SSH tunnel" box and round-trip graph.
+# 0 = off. Point it at a local port that ssh forwards to the tunnel's remote
+# listening port, e.g. -L 127.0.0.1:33316:127.0.0.1:33306 -> probe_port = 33316.
+probe_host    = 127.0.0.1
+probe_port    = 0
+probe_timeout_s = 3
+
+[web]
+# NGINX and PHP-FPM statistics. Polled only while an nginx process is running.
+# nginx_url: a stub_status location; fpm_url: the PHP-FPM status page (pm.status_path).
+# Keep both on a loopback-only listener. Leave a value empty to skip that page;
+# leave both empty to switch the web statistics off.
+nginx_url     = http://127.0.0.1:8080/nginx_status
+fpm_url       = http://127.0.0.1:8080/fpm_status
 EOF
     chmod 640 "$CONFIG_FILE"
     chown root:"$SERVICE_USER" "$CONFIG_FILE"
