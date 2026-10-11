@@ -194,8 +194,8 @@
   </div>
 
   <!-- MySQL gauges -->
-  <div class="section-title" id="mysql-section-title">MySQL / MariaDB</div>
-  <div class="gauges" id="mysql-gauges">
+  <div class="section-title mysql-only" id="mysql-section-title">MySQL / MariaDB</div>
+  <div class="gauges mysql-only" id="mysql-gauges">
     <div class="card">
       <div class="card-label">Queries/s</div>
       <div class="card-value" id="v-qps">—</div>
@@ -230,8 +230,8 @@
   </div>
 
   <!-- OLA Java gauges -->
-  <div class="section-title" id="java-section-title">OLA Java</div>
-  <div class="gauges" id="java-gauges">
+  <div class="section-title ola-only" id="java-section-title">OLA Java</div>
+  <div class="gauges ola-only" id="java-gauges">
     <div class="card" id="g-java-status">
       <div class="card-label">Process</div>
       <div class="card-value" id="v-java-status">—</div>
@@ -324,19 +324,19 @@
       <div class="chart-title">Disk I/O (all disks)</div>
       <canvas id="ch-disk" height="120"></canvas>
     </div>
-    <div class="chart-card">
+    <div class="chart-card mysql-only">
       <div class="chart-title">MySQL — Queries/s &amp; Connections</div>
       <canvas id="ch-mysql" height="120"></canvas>
     </div>
-    <div class="chart-card">
+    <div class="chart-card mysql-only">
       <div class="chart-title">MySQL — Buffer Pool Hit %</div>
       <canvas id="ch-bphit" height="120"></canvas>
     </div>
-    <div class="chart-card">
+    <div class="chart-card ola-only">
       <div class="chart-title">OLA Java — CPU % &amp; Memory MB</div>
       <canvas id="ch-java-proc" height="120"></canvas>
     </div>
-    <div class="chart-card">
+    <div class="chart-card ola-only">
       <div class="chart-title">OLA Java — Threads &amp; Open FDs</div>
       <canvas id="ch-java-thr" height="120"></canvas>
     </div>
@@ -644,6 +644,14 @@ function updateGauges(d) {
   setBar('b-fd', ofd.usage_pct, 50, 80);
   setCard('g-fd', ofd.usage_pct, 50, 80);
 
+  // MySQL and OLA sections are hidden on servers where they are not installed (d.installed from the collector).
+  const inst = d.installed || {};
+  const showIf = (cls, on) => document.querySelectorAll(cls).forEach(el => { el.style.display = on ? '' : 'none'; });
+  showIf('.mysql-only', inst.mysql !== false);
+  showIf('.ola-only',   inst.ola   !== false);
+  if (inst.ola !== false) updateJava(hist);
+  if (inst.mysql === false) return;
+
   // ── MySQL
   const mysqlTitle = document.getElementById('mysql-section-title');
   if (!mysql.available) {
@@ -688,7 +696,9 @@ function updateGauges(d) {
 
   document.getElementById('v-dbup').textContent = fmtUptime(mysql.uptime_s);
   document.getElementById('s-dbver').textContent = mysql.version ?? '—';
+}
 
+function updateJava(hist) {
   // ── OLA Java — data comes from healthcheck.json history (no separate services.json fetch)
   // The gauges show the most recent history values since the JSON structure
   // keeps full process details in services.json; history arrays in healthcheck.json.

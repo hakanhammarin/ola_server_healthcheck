@@ -99,6 +99,12 @@ lsof_enabled  = true
 defaults_file = /etc/10mila-sysmon/mysql.cnf
 host          = 127.0.0.1
 port          = 3306
+# MySQL is monitored only where it is installed: one of these paths exists or mysqld runs.
+# installed_paths = /usr/sbin/mysqld /usr/libexec/mysqld /usr/sbin/mariadbd /usr/libexec/mariadbd
+
+[ola]
+# The OLA server is monitored only where it is installed: one of these paths exists or it runs.
+# installed_paths = /opt/OLA_6 /etc/systemd/system/ola10mila.service
 
 [tunnel]
 # autossh monitor port (-M flag in ssh_reverse_tunnel.sh). Set to 0 to disable.

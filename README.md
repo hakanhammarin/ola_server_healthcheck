@@ -94,6 +94,12 @@ Dashboard URL: `http://<server>:8082/healthcheck.html`
 - Slow queries, open tables
 - DB traffic bytes sent/received
 
+MySQL and the OLA server are monitored only where they are installed. On a server without
+one of them (for example the online web server) the collector does not poll it and the page
+hides its boxes and graphs. Installed means: its process runs, or one of `installed_paths`
+in `[mysql]` / `[ola]` in `config.ini` exists (defaults: the `mysqld` / `mariadbd` binary,
+`/opt/OLA_6` or `ola10mila.service`).
+
 **SSH tunnel** (when `probe_port` is set in `[tunnel]`)
 - Status box in the System row: UP / DOWN from a TCP probe through the tunnel
 - Round trip of the probe in ms, as a graph; failed probes show as a red band

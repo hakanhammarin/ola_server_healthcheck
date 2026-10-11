@@ -517,6 +517,17 @@ class ProcessMonitor:
         return out
 
 
+# ─── What is installed here ──────────────────────────────────────────────────
+# A server without MySQL or without the OLA server (e.g. the online web server) gets no
+# local monitoring of it: nothing is polled and the page hides the section.
+MYSQL_PATHS = ["/usr/sbin/mysqld", "/usr/libexec/mysqld", "/usr/sbin/mariadbd", "/usr/libexec/mariadbd"]
+OLA_PATHS   = ["/opt/OLA_6", "/etc/systemd/system/ola10mila.service"]
+
+
+def installed(paths: list[str]) -> bool:
+    return any(os.path.exists(p) for p in paths)
+
+
 # ─── SSH tunnel health ───────────────────────────────────────────────────────
 
 class TunnelMonitor:
@@ -1029,6 +1040,7 @@ def selftest() -> None:
     assert w._rate("c", 5, 20.0) is None            # counter went backwards: service restarted
     h = restore_history({"history": {"timestamps": ["a", "b"], "cpu_pct": [1, 2]}}, 10)
     assert list(h["nginx_rps"]) == [None, None] and list(h["cpu_pct"]) == [1, 2]
+    assert installed(["/nonexistent", "/"]) and not installed(["/nonexistent"]) and not installed([])
     print("selftest ok")
 
 
@@ -1055,6 +1067,9 @@ def main() -> None:
     mysql_cfg    = cfg.get   ("mysql",    "defaults_file",fallback=MYSQL_DEFAULTS_FILE)
     mysql_host   = cfg.get   ("mysql",    "host",         fallback=MYSQL_HOST)
     mysql_port   = cfg.get   ("mysql",    "port",         fallback=MYSQL_PORT)
+    # Space separated paths; MySQL or OLA counts as installed when one of them exists.
+    mysql_paths  = cfg.get   ("mysql",    "installed_paths", fallback=" ".join(MYSQL_PATHS)).split()
+    ola_paths    = cfg.get   ("ola",      "installed_paths", fallback=" ".join(OLA_PATHS)).split()
     tunnel_port  = cfg.getint("tunnel",   "monitor_port", fallback=20000)
     tunnel_svc   = cfg.get   ("tunnel",   "service_name", fallback="ssh_reverse_tunnel")
     probe_host   = cfg.get   ("tunnel",   "probe_host",   fallback="127.0.0.1")
@@ -1107,6 +1122,14 @@ def main() -> None:
 
         ts_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
+        # Sampled first: Java metrics flow into history AND services, and a running
+        # process counts as installed, wherever it was installed.
+        processes = proc_mon.sample()
+        has_mysql = processes["mysql"]["available"]    or installed(mysql_paths)
+        has_ola   = processes["ola_java"]["available"] or installed(ola_paths)
+        processes["mysql"]["installed"]    = has_mysql
+        processes["ola_java"]["installed"] = has_ola
+
         snapshot: dict = {
             "meta": {
                 "version":        "1.1",
@@ -1129,13 +1152,11 @@ def main() -> None:
                     "processes": sample_processes(),
                 },
             },
-            "mysql": db_mon.sample(),
+            "installed": {"mysql": has_mysql, "ola": has_ola},
+            "mysql": db_mon.sample() if has_mysql else {"available": False},
             "ssh_tunnel": tunnel_mon.sample(),
             "web": web_mon.sample(),
         }
-
-        # Sample processes here so Java metrics flow into history AND services
-        processes = proc_mon.sample()
 
         push_history(history, snapshot, processes)
         snapshot["history"] = serialise_history(history)
