@@ -102,6 +102,12 @@ port          = 3306
 # MySQL is monitored only where it is installed: one of these paths exists or mysqld runs.
 # installed_paths = /usr/sbin/mysqld /usr/libexec/mysqld /usr/sbin/mariadbd /usr/libexec/mariadbd
 
+[replication]
+# Heartbeat: a table (k, v) whose row k='heartbeat' the source rewrites with UTC_TIMESTAMP every 60 s.
+# Replication shows ALARM when the row is older than max_age_s, or when a replica thread has stopped.
+# heartbeat_table = replmon.replicamonitoring
+# max_age_s       = 120
+
 [ola]
 # The OLA server is monitored only where it is installed: one of these paths exists or it runs.
 # installed_paths = /opt/OLA_6 /etc/systemd/system/ola10mila.service

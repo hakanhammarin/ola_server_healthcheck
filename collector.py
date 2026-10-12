@@ -17,6 +17,7 @@ import json
 import os
 import re
 import socket
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -43,6 +44,9 @@ HTTP_PORT      = 8082       # built-in HTTP server port (0 = disabled)
 MYSQL_DEFAULTS_FILE = "/etc/10mila-sysmon/mysql.cnf"   # [client] user/password
 MYSQL_HOST     = "127.0.0.1"
 MYSQL_PORT     = "3306"
+# Replication heartbeat: one key:value row the source rewrites with its UTC time every 60 s.
+REPL_TABLE     = "replmon.replicamonitoring"
+REPL_MAX_AGE   = 120        # seconds: 60 s between heartbeats + 60 s allowed deviation
 
 # ─── Built-in HTTP server ────────────────────────────────────────────────────
 
@@ -756,10 +760,16 @@ class WebMonitor:
 class MySQLMonitor:
     """Reads SHOW GLOBAL STATUS + SHOW GLOBAL VARIABLES via mysql CLI."""
 
-    def __init__(self, defaults_file: str, host: str, port: str):
+    def __init__(self, defaults_file: str, host: str, port: str,
+                 heartbeat_table: str = REPL_TABLE, max_age_s: float = REPL_MAX_AGE):
         self._defaults = defaults_file
         self._host     = host
         self._port     = port
+        # The name goes into SQL: accept schema.table only, anything else switches the heartbeat off.
+        self._hb_table = heartbeat_table if re.fullmatch(r"\w+\.\w+", heartbeat_table) else ""
+        self._max_age  = max_age_s
+        self._last_hb  = None                              # heartbeat value seen last
+        self._delays: deque = deque(maxlen=30)             # one apply delay per heartbeat (about 30 min)
         self._prev_status: dict[str, int] = {}
         self._prev_time: float = time.monotonic()
 
@@ -780,6 +790,69 @@ class MySQLMonitor:
             return result
         except (subprocess.TimeoutExpired, FileNotFoundError):
             return {}
+
+    def _replication(self) -> dict:
+        """
+        Replication health, the same on the source and on a replica.
+
+        - Heartbeat: the age of the row the source rewrites every 60 s. On the source it shows
+          that the injecting service works; on a replica that changes really arrive.
+        - Replica threads (I/O and SQL) from performance_schema; none on a source.
+        - Delay: commit on the source to applied here, for the last replicated transaction
+          (MySQL's own microsecond timestamps; the heartbeat keeps it fresh on a quiet system).
+          Jitter is the standard deviation of the delay over the last 30 heartbeats.
+          Both include any clock difference between the two servers.
+        ok is True / False, or None where there is nothing to judge (no heartbeat, no replica).
+        """
+        hb = self._query(f"SELECT v, TIMESTAMPDIFF(MICROSECOND, v, UTC_TIMESTAMP(6)) "
+                         f"FROM {self._hb_table} WHERE k = 'heartbeat'") if self._hb_table else {}
+        rep = self._query(
+            "SELECT 'io', SERVICE_STATE FROM performance_schema.replication_connection_status "
+            "UNION ALL SELECT 'sql', SERVICE_STATE FROM performance_schema.replication_applier_status "
+            "UNION ALL (SELECT 'delay_us', TIMESTAMPDIFF(MICROSECOND, "
+            "LAST_APPLIED_TRANSACTION_ORIGINAL_COMMIT_TIMESTAMP, LAST_APPLIED_TRANSACTION_END_APPLY_TIMESTAMP) "
+            "FROM performance_schema.replication_applier_status_by_worker "
+            "ORDER BY LAST_APPLIED_TRANSACTION_END_APPLY_TIMESTAMP DESC LIMIT 1)")
+        return self._judge(hb, rep)
+
+    def _judge(self, hb: dict, rep: dict) -> dict:
+        def num(text: "str | None") -> "float | None":
+            try:
+                return float(text)
+            except (TypeError, ValueError):
+                return None                                # NULL: nothing applied yet
+
+        hb_at, age_s = None, None
+        if hb:
+            hb_at, raw = next(iter(hb.items()))
+            age_s = num(raw)
+            age_s = None if age_s is None else round(age_s / 1e6, 1)
+        replica  = "io" in rep
+        io_ok    = rep.get("io") == "ON"
+        sql_ok   = rep.get("sql") == "ON"
+        delay_us = num(rep.get("delay_us")) if replica else None
+        delay_ms = None if delay_us is None else round(delay_us / 1000, 1)
+        if replica and hb_at != self._last_hb and delay_ms is not None:
+            self._delays.append(delay_ms)
+        self._last_hb = hb_at
+
+        reasons = []
+        if replica and not (io_ok and sql_ok):
+            reasons.append(f"replica threads: I/O {rep.get('io', '?')}, SQL {rep.get('sql', '?')}")
+        if age_s is not None and age_s > self._max_age:
+            reasons.append(f"heartbeat {age_s:.0f} s old (limit {self._max_age:.0f} s)")
+        return {
+            "role":            "replica" if replica else "source",
+            "io_running":      io_ok if replica else None,
+            "sql_running":     sql_ok if replica else None,
+            "heartbeat_at":    hb_at,
+            "heartbeat_age_s": age_s,
+            "max_age_s":       self._max_age,
+            "delay_ms":        delay_ms,
+            "jitter_ms":       round(statistics.pstdev(self._delays), 1) if len(self._delays) > 1 else None,
+            "ok":              None if not (replica or hb) else not reasons,
+            "reason":          "; ".join(reasons),
+        }
 
     def sample(self) -> dict:
         status = self._query("SHOW GLOBAL STATUS")
@@ -870,6 +943,7 @@ class MySQLMonitor:
             "replication": {
                 "slave_running": status.get("Slave_running",
                                  status.get("Replica_running", "OFF")),
+                **self._replication(),
             },
         }
 
@@ -889,6 +963,8 @@ HISTORY_KEYS = [
     "java_cpu_pct", "java_mem_mb", "java_threads", "java_open_fds",
     # SSH tunnel TCP probe: round trip in ms (None when the probe failed) and up/down as 1/0
     "tunnel_rtt_ms", "tunnel_up",
+    # MySQL replication: heartbeat age (s), apply delay (ms), health as 1/0 (None where not in use)
+    "repl_age_s", "repl_delay_ms", "repl_ok",
     # NGINX + PHP-FPM (None while nginx is not running or a status page does not answer)
     "nginx_active", "nginx_waiting", "nginx_rps",
     "fpm_active", "fpm_idle", "fpm_queue", "fpm_rps",
@@ -949,6 +1025,11 @@ def push_history(h: dict[str, deque], snapshot: dict,
     tunnel = snapshot.get("ssh_tunnel", {})
     h["tunnel_rtt_ms"].append(tunnel.get("rtt_ms"))
     h["tunnel_up"].append(1 if tunnel.get("available") else 0)
+
+    repl = mysql.get("replication", {})
+    h["repl_age_s"].append(repl.get("heartbeat_age_s"))
+    h["repl_delay_ms"].append(repl.get("delay_ms"))
+    h["repl_ok"].append(None if repl.get("ok") is None else int(repl["ok"]))
 
     web = snapshot.get("web", {})
     ng  = web.get("nginx", {})
@@ -1041,6 +1122,19 @@ def selftest() -> None:
     h = restore_history({"history": {"timestamps": ["a", "b"], "cpu_pct": [1, 2]}}, 10)
     assert list(h["nginx_rps"]) == [None, None] and list(h["cpu_pct"]) == [1, 2]
     assert installed(["/nonexistent", "/"]) and not installed(["/nonexistent"]) and not installed([])
+    m = MySQLMonitor("", "", "", "replmon.replicamonitoring", 120)
+    assert MySQLMonitor("", "", "", "x; DROP TABLE y")._hb_table == ""
+    assert m._judge({}, {})["ok"] is None                                    # no heartbeat, no replica
+    src = m._judge({"2026-10-12 17:00:00.000": "31000000"}, {})              # source, 31 s old
+    assert src["ok"] is True and src["role"] == "source" and src["heartbeat_age_s"] == 31.0 and src["delay_ms"] is None
+    assert m._judge({"2026-10-12 17:00:00.000": "121000000"}, {})["ok"] is False   # more than 60 s late
+    up = {"io": "ON", "sql": "ON", "delay_us": "4200"}
+    r = m._judge({"a": "5000000"}, up)
+    assert r["ok"] is True and r["role"] == "replica" and r["delay_ms"] == 4.2 and r["jitter_ms"] is None
+    m._judge({"a": "9000000"}, {**up, "delay_us": "9999"})                   # same heartbeat: no new delay sample
+    assert m._judge({"b": "5000000"}, {**up, "delay_us": "6200"})["jitter_ms"] == 1.0
+    r = m._judge({"b": "5000000"}, {"io": "CONNECTING", "sql": "ON", "delay_us": "NULL"})
+    assert r["ok"] is False and r["delay_ms"] is None and "I/O CONNECTING" in r["reason"]
     print("selftest ok")
 
 
@@ -1067,6 +1161,8 @@ def main() -> None:
     mysql_cfg    = cfg.get   ("mysql",    "defaults_file",fallback=MYSQL_DEFAULTS_FILE)
     mysql_host   = cfg.get   ("mysql",    "host",         fallback=MYSQL_HOST)
     mysql_port   = cfg.get   ("mysql",    "port",         fallback=MYSQL_PORT)
+    repl_table   = cfg.get   ("replication", "heartbeat_table", fallback=REPL_TABLE)
+    repl_max_age = cfg.getfloat("replication", "max_age_s",    fallback=REPL_MAX_AGE)
     # Space separated paths; MySQL or OLA counts as installed when one of them exists.
     mysql_paths  = cfg.get   ("mysql",    "installed_paths", fallback=" ".join(MYSQL_PATHS)).split()
     ola_paths    = cfg.get   ("ola",      "installed_paths", fallback=" ".join(OLA_PATHS)).split()
@@ -1093,7 +1189,7 @@ def main() -> None:
     cpu_mon  = CpuMonitor()
     disk_mon = DiskMonitor()
     net_mon  = NetMonitor()
-    db_mon     = MySQLMonitor(mysql_cfg, mysql_host, mysql_port)
+    db_mon     = MySQLMonitor(mysql_cfg, mysql_host, mysql_port, repl_table, repl_max_age)
     proc_mon   = ProcessMonitor()
     tunnel_mon = TunnelMonitor(tunnel_port, tunnel_svc, probe_host, probe_port, probe_timeout)
     web_mon    = WebMonitor(nginx_url, fpm_url)
@@ -1193,6 +1289,9 @@ def main() -> None:
                     "mounts": snapshot["current"].get("disk_space", []),
                 },
                 "ola_java":    processes.get("ola_java", {"available": False}),
+                # Binary health for the central monitoring: available = replication is healthy.
+                "replication": {**snapshot["mysql"].get("replication", {}),
+                                "available": snapshot["mysql"].get("replication", {}).get("ok") is True},
                 "ssh_tunnel":  snapshot["ssh_tunnel"],
                 "web":         snapshot["web"],
             },

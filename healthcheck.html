@@ -227,6 +227,16 @@
       <div class="card-value" id="v-dbup">—</div>
       <div class="card-sub"  id="s-dbver">—</div>
     </div>
+    <div class="card" id="g-repl">
+      <div class="card-label">Replication</div>
+      <div class="card-value" id="v-repl">—</div>
+      <div class="card-sub"  id="s-repl">heartbeat —</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Replication delay</div>
+      <div class="card-value" id="v-repldelay">—</div>
+      <div class="card-sub"  id="s-repldelay">jitter —</div>
+    </div>
   </div>
 
   <!-- OLA Java gauges -->
@@ -331,6 +341,10 @@
     <div class="chart-card mysql-only">
       <div class="chart-title">MySQL — Buffer Pool Hit %</div>
       <canvas id="ch-bphit" height="120"></canvas>
+    </div>
+    <div class="chart-card mysql-only">
+      <div class="chart-title">MySQL — Replication heartbeat age (s) &amp; delay (ms)</div>
+      <canvas id="ch-repl" height="120"></canvas>
     </div>
     <div class="chart-card ola-only">
       <div class="chart-title">OLA Java — CPU % &amp; Memory MB</div>
@@ -534,6 +548,13 @@ const charts = {
     { label: 'Buffer pool hit %', borderColor: C.bphit, backgroundColor: 'rgba(174,62,201,.07)', fill: true },
   ], '%', 100),
 
+  // Heartbeat age is a sawtooth of 0-60 s while healthy; the red band marks an alarm.
+  repl: makeChart('ch-repl', [
+    { label: 'Heartbeat age (s)', borderColor: C.qps,  yAxisID: 'y' },
+    { label: 'Delay (ms)',        borderColor: C.conn, yAxisID: 'y1' },
+    { label: 'Alarm', borderColor: C.tdown, backgroundColor: 'rgba(207,34,46,.18)', fill: true, stepped: true, yAxisID: 'yDown' },
+  ], null),
+
   javaProc: makeChart('ch-java-proc', [
     { label: 'CPU %',    borderColor: C.jcpu, backgroundColor: 'rgba(201,42,42,.07)', fill: true, yAxisID: 'y' },
     { label: 'Mem MB',   borderColor: C.jmem, yAxisID: 'y1' },
@@ -573,6 +594,15 @@ for (const c of [charts.nginx, charts.fpm]) {
 // SSH tunnel chart: a failed probe leaves a gap in the line and a red band behind it
 charts.tunnel.options.scales.yDown = { display: false, min: 0, max: 1 };
 charts.tunnel.update();
+
+// Replication chart: delay on a right-hand axis, alarm as a red band
+charts.repl.options.scales.y1 = {
+  type: 'linear', position: 'right', beginAtZero: true,
+  grid: { drawOnChartArea: false }, ticks: { maxTicksLimit: 5 },
+  title: { display: true, text: 'ms', font: { size: 10 } },
+};
+charts.repl.options.scales.yDown = { display: false, min: 0, max: 1 };
+charts.repl.update();
 
 // Second Y-axis for MySQL chart (connections on right)
 charts.mysql.options.scales.y1 = {
@@ -696,6 +726,28 @@ function updateGauges(d) {
 
   document.getElementById('v-dbup').textContent = fmtUptime(mysql.uptime_s);
   document.getElementById('s-dbver').textContent = mysql.version ?? '—';
+  updateReplication(mysql.replication || {});
+}
+
+// Replication box: binary health from the collector (heartbeat row age, replica threads).
+function updateReplication(r) {
+  const card = document.getElementById('g-repl');
+  const val  = document.getElementById('v-repl');
+  const sub  = document.getElementById('s-repl');
+  if (r.ok == null) {
+    card.className = 'card'; val.textContent = 'n/a'; val.style.color = 'var(--muted)';
+    sub.textContent = 'no heartbeat, not a replica';
+  } else {
+    card.className = 'card ' + (r.ok ? 'status-green' : 'status-red');
+    val.textContent = r.ok ? 'OK' : 'ALARM';
+    val.style.color = r.ok ? 'var(--green)' : 'var(--red)';
+    const age = r.heartbeat_age_s == null ? 'no heartbeat' : `heartbeat ${r.heartbeat_age_s.toFixed(0)} s old`;
+    sub.textContent = r.ok ? `${r.role} · ${age}` : `${r.role} · ${r.reason}`;
+  }
+  document.getElementById('v-repldelay').textContent = r.delay_ms == null ? '—' : `${r.delay_ms} ms`;
+  document.getElementById('s-repldelay').textContent =
+    r.role === 'replica' ? `jitter ${r.jitter_ms == null ? '—' : r.jitter_ms + ' ms'} · source to applied here`
+                         : 'measured on the replicas';
 }
 
 function updateJava(hist) {
@@ -827,6 +879,11 @@ function updateCharts(hist) {
 
   upd(charts.bphit,
     hist.mysql_buf_hit_pct);
+
+  upd(charts.repl,
+    hist.repl_age_s    || [],
+    hist.repl_delay_ms || [],
+    (hist.repl_ok || []).map(v => (v === 0 ? 1 : 0)));
 
   upd(charts.javaProc,
     hist.java_cpu_pct  || [],

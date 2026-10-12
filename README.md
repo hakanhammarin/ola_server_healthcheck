@@ -48,8 +48,34 @@ Edit `/etc/10mila-sysmon/mysql.cnf` and set the correct password, then create th
 ```sql
 CREATE USER 'sysmon'@'127.0.0.1' IDENTIFIED BY 'YOUR_PASSWORD';
 GRANT PROCESS, REPLICATION CLIENT ON *.* TO 'sysmon'@'127.0.0.1';
+-- only for the replication box: replica threads and delay, and the heartbeat row
+GRANT SELECT ON performance_schema.* TO 'sysmon'@'127.0.0.1';
+GRANT SELECT ON replmon.* TO 'sysmon'@'127.0.0.1';
 FLUSH PRIVILEGES;
 ```
+
+## Replication monitoring
+
+The source server rewrites one row with its own UTC time every 60 seconds:
+
+```sql
+CREATE TABLE replmon.replicamonitoring (k VARCHAR(32) PRIMARY KEY, v DATETIME(3) NOT NULL);
+REPLACE INTO replmon.replicamonitoring VALUES ('heartbeat', UTC_TIMESTAMP(3));   -- every 60 s
+```
+
+Every collector that can read the row (source and replicas) reports under `mysql.replication` in
+`healthcheck.json` and under `services.replication` in `services.json`:
+
+| Field | Meaning |
+|---|---|
+| `ok` | binary health: the heartbeat is at most `max_age_s` old (default 120 = 60 s interval + 60 s deviation) and, on a replica, both replica threads run. `null` where there is no heartbeat and no replica |
+| `heartbeat_age_s` | age of the heartbeat row by this server's clock |
+| `delay_ms` | replica only: commit on the source to applied here, for the last replicated transaction (MySQL's own timestamps in `performance_schema`) |
+| `jitter_ms` | replica only: standard deviation of `delay_ms` over the last 30 heartbeats |
+| `reason` | why `ok` is false |
+
+Delay and jitter include any clock difference between the servers, so keep them time-synchronised.
+Table name and limit are set in `[replication]` in `config.ini`.
 
 ## Built-in HTTP server
 
@@ -93,6 +119,7 @@ Dashboard URL: `http://<server>:8082/healthcheck.html`
 - InnoDB buffer pool hit % and size
 - Slow queries, open tables
 - DB traffic bytes sent/received
+- Replication: OK / ALARM box from a heartbeat row, heartbeat age, replica delay and jitter
 
 MySQL and the OLA server are monitored only where they are installed. On a server without
 one of them (for example the online web server) the collector does not poll it and the page
