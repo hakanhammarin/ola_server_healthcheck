@@ -106,17 +106,18 @@ access_log syslog:server=unix:/dev/shm/10mila-sysmon/devices.sock,nohostname,tag
 ```
 
 The collector binds the socket (mode 0666, so the nginx workers can send), counts devices in memory
-(at most 50 000) and writes `statistics.json` every `interval` seconds:
+(at most 50 000) and writes `statistics.json` every `interval` seconds. Bots (curl, wget, crawlers, headless
+browsers…) are never a device; their page loads only add to `bot_hits`. An empty user agent counts as "Unknown".
 
 ```json
-{"generated": 1760551990.1, "since": 1760550000.0, "devices": 2,
+{"generated": 1760551990.1, "since": 1760550000.0, "devices": 2, "bot_hits": 17,
  "by_browser": {"Safari": 1, "Chrome": 1}, "by_os": {"iOS": 1, "Windows": 1},
  "new_per_hour": {"2026-10-15T18:00:00Z": 2},
  "list": {"<32 hex uid>": {"ua": "Mozilla/5.0 ...", "first": 1760551980.123, "last": 1760551990.0, "hits": 3}}}
 ```
 
 Times are Unix seconds; `new_per_hour` counts devices by the UTC hour they were first seen. A service
-restart keeps the count (it reads the old `statistics.json`); a reboot clears it. Malformed datagrams are
+restart keeps the count (it reads the old `statistics.json`, dropping any bot found there); a reboot clears it. Malformed datagrams are
 ignored. `python3 collector.py --selftest` checks the datagram parser and the browser/OS families.
 
 ## File locations

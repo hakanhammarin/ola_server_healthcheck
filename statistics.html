@@ -100,6 +100,7 @@
       <div class="card-label">Page loads</div>
       <div class="card-value" id="v-hits">—</div>
       <div class="card-sub" id="s-hits">— per device</div>
+      <div class="card-sub" id="s-bots">bots —</div>
     </div>
   </div>
 
@@ -216,6 +217,7 @@ async function poll() {
     $('v-new').textContent     = fmtNum(devs.filter(d => d.first >= s.generated - 3600).length);
     $('v-hits').textContent    = fmtNum(hits);
     $('s-hits').textContent    = (s.devices ? (hits / s.devices).toFixed(1) : '—') + ' per device';
+    $('s-bots').textContent    = `+ ${fmtNum(s.bot_hits || 0)} by bots (not counted)`;
     bars('browsers', s.by_browser, s.devices);
     bars('systems',  s.by_os,      s.devices);
     perHour(s.new_per_hour);

@@ -1182,22 +1182,30 @@ class DeviceCounter:
         self.lock    = threading.Lock()
         self.devices: dict = {}
         self.since   = round(time.time(), 3)
+        self.bot_hits = 0                              # page loads by bots: counted, never a device
         self.dirty   = True
         # A restart keeps the count (tmpfs: gone after a reboot, like healthcheck.json's history).
         try:
             with open(out_path) as f:
                 old = json.load(f)
             for uid, d in old.get("list", {}).items():
-                if len(self.devices) < DEVICES_MAX and re.fullmatch(r"[0-9A-F]{32}", uid):
+                if len(self.devices) < DEVICES_MAX and re.fullmatch(r"[0-9A-F]{32}", uid) \
+                        and ua_family(str(d["ua"]))[0] != "Bot":
                     self.devices[uid] = {"ua": str(d["ua"])[:UA_MAX], "first": float(d["first"]),
                                          "last": float(d["last"]), "hits": int(d["hits"])}
             self.since = float(old.get("since", self.since))
+            self.bot_hits = int(old.get("bot_hits", 0))
             print(f"[sysmon] devices: restored {len(self.devices)}", flush=True)
         except (OSError, ValueError, KeyError, TypeError, AttributeError):
             pass
 
     def add(self, uid: str, ts: float, ua: str) -> None:
+        bot = ua_family(ua)[0] == "Bot"
         with self.lock:
+            self.dirty = True
+            if bot:
+                self.bot_hits += 1
+                return
             d = self.devices.get(uid)
             if d is None:
                 if len(self.devices) >= DEVICES_MAX:
@@ -1208,11 +1216,11 @@ class DeviceCounter:
                 d["first"], d["last"] = min(d["first"], ts), max(d["last"], ts)
                 if ua:
                     d["ua"] = ua
-            self.dirty = True
 
     def snapshot(self) -> dict:
         with self.lock:
             devices = {uid: dict(d) for uid, d in self.devices.items()}
+            bot_hits = self.bot_hits
         browsers: dict = {}
         systems:  dict = {}
         per_hour: dict = {}
@@ -1227,6 +1235,7 @@ class DeviceCounter:
             "generated":    round(time.time(), 3),
             "since":        self.since,
             "devices":      len(devices),
+            "bot_hits":     bot_hits,
             "by_browser":   by_count(browsers),
             "by_os":        by_count(systems),
             "new_per_hour": dict(sorted(per_hour.items())),
@@ -1340,12 +1349,19 @@ def selftest() -> None:
     dc = DeviceCounter("", "/nonexistent/statistics.json", 5)
     dc.add(uid.upper(), 1760551980.0, iphone)
     dc.add(uid.upper(), 1760551990.0, "")                      # empty UA keeps the known one
-    dc.add("F" * 32, 1760555600.0, "curl/8.5.0")
+    dc.add("F" * 32, 1760555600.0, "curl/8.5.0")              # bots: a hit, never a device
+    dc.add("F" * 32, 1760555601.0, "Googlebot/2.1")
+    dc.add("E" * 32, 1760555600.0, "")                         # empty UA: counted, as Unknown
     st = dc.snapshot()
-    assert st["devices"] == 2 and st["list"][uid.upper()] == {"ua": iphone, "first": 1760551980.0,
-                                                              "last": 1760551990.0, "hits": 2}
-    assert st["by_browser"] == {"Bot": 1, "Safari": 1} and st["by_os"] == {"Other": 1, "iOS": 1}
+    assert st["devices"] == 2 and st["bot_hits"] == 2 and "F" * 32 not in st["list"], st
+    assert st["list"][uid.upper()] == {"ua": iphone, "first": 1760551980.0, "last": 1760551990.0, "hits": 2}
+    assert st["by_browser"] == {"Safari": 1, "Unknown": 1} and st["by_os"] == {"Unknown": 1, "iOS": 1}
     assert st["new_per_hour"] == {"2025-10-15T18:00:00Z": 1, "2025-10-15T19:00:00Z": 1}, st["new_per_hour"]
+    with tempfile.TemporaryDirectory() as tmp:                 # a restart keeps the count and drops old bot devices
+        path = os.path.join(tmp, "statistics.json")
+        write_json(path, {**st, "list": {**st["list"], "F" * 32: {"ua": "curl/8.5.0", "first": 1e9 + 1, "last": 1e9 + 1, "hits": 9}}})
+        st2 = DeviceCounter("", path, 5).snapshot()
+        assert st2["devices"] == 2 and st2["bot_hits"] == 2 and st2["since"] == st["since"], st2
     print("selftest ok")
 
 
