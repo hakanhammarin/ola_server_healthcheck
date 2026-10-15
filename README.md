@@ -11,6 +11,7 @@ Metrics are collected every 5 seconds, stored in RAM (`/dev/shm`), and served by
 | `collector.py` | Python 3 daemon — collects metrics and writes JSON |
 | `10mila-sysmon.service` | systemd unit file |
 | `healthcheck.html` | Chart.js live dashboard (served on port 8082) |
+| `statistics.html` | Unique devices on the online results site (web server only, no external hosts) |
 
 ## Requirements
 
@@ -86,10 +87,37 @@ The collector embeds a lightweight HTTP server (Python `http.server`, stdlib-onl
 | `http://192.168.1.21:8082/healthcheck.html` | Live dashboard |
 | `http://192.168.1.21:8082/healthcheck.json` | Full metrics + 30 min history |
 | `http://192.168.1.21:8082/services.json` | Compact per-service snapshot |
+| `http://<online>:8082/statistics.html` | Unique devices on the online results (only where `[devices]` is on) |
+| `http://<online>:8082/statistics.json` | The same as JSON |
 
 No dependency on Jetty/Java. Port is configurable in `/etc/10mila-sysmon/config.ini` (`http_port = 8082`). Set to `0` to disable.
 
 > `/dev/shm/10mila-sysmon/healthcheck.html` is cleared on reboot, but the service automatically copies it from `/opt/10mila-sysmon/healthcheck.html` (installed by `install.sh`) on every start via `ExecStartPre`. The copy is non-fatal — if the source is missing the service still starts.
+
+## Unique devices (online results server)
+
+Off by default; switched on with `[devices] socket = /dev/shm/10mila-sysmon/devices.sock` in `config.ini`
+(the deploy does this on the online server only). NGINX gives every browser a cookie `tmdev`
+(`ngx_http_userid_module`) and sends one syslog datagram per HTML page load to that unix socket:
+
+```nginx
+log_format devices escape=json '$uid_got$uid_set\t$msec\t$http_user_agent';
+access_log syslog:server=unix:/dev/shm/10mila-sysmon/devices.sock,nohostname,tag=tmdev devices;
+```
+
+The collector binds the socket (mode 0666, so the nginx workers can send), counts devices in memory
+(at most 50 000) and writes `statistics.json` every `interval` seconds:
+
+```json
+{"generated": 1760551990.1, "since": 1760550000.0, "devices": 2,
+ "by_browser": {"Safari": 1, "Chrome": 1}, "by_os": {"iOS": 1, "Windows": 1},
+ "new_per_hour": {"2026-10-15T18:00:00Z": 2},
+ "list": {"<32 hex uid>": {"ua": "Mozilla/5.0 ...", "first": 1760551980.123, "last": 1760551990.0, "hits": 3}}}
+```
+
+Times are Unix seconds; `new_per_hour` counts devices by the UTC hour they were first seen. A service
+restart keeps the count (it reads the old `statistics.json`); a reboot clears it. Malformed datagrams are
+ignored. `python3 collector.py --selftest` checks the datagram parser and the browser/OS families.
 
 ## File locations
 

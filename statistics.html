@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>10mila — Online statistics</title>
+<style>
+  :root {
+    --bg:       #f5f7fa;
+    --surface:  #ffffff;
+    --border:   #d0d7de;
+    --text:     #0d1117;
+    --muted:    #57606a;
+    --green:    #1a7f37;
+    --red:      #cf222e;
+    --blue:     #0969da;
+    --purple:   #8250df;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg); color: var(--text);
+    font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+    font-size: 13px; min-height: 100vh;
+  }
+  header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 12px 20px; background: var(--surface); border-bottom: 1px solid var(--border);
+    position: sticky; top: 0; z-index: 100;
+  }
+  header h1 { font-size: 16px; font-weight: 600; letter-spacing: .5px; }
+  header a  { color: var(--blue); text-decoration: none; }
+  #meta      { font-size: 11px; color: var(--muted); text-align: right; line-height: 1.6; }
+  #status-dot {
+    width: 10px; height: 10px; border-radius: 50%; background: var(--muted);
+    display: inline-block; margin-right: 6px; vertical-align: middle; transition: background .3s;
+  }
+  main { padding: 16px 20px; }
+  .section-title {
+    font-size: 13px; font-weight: 600; color: var(--muted); text-transform: uppercase;
+    letter-spacing: .8px; margin: 20px 0 10px; padding-bottom: 6px; border-bottom: 1px solid var(--border);
+  }
+  .gauges { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 12px; margin-bottom: 20px; }
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px; }
+  .card-label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .6px; margin-bottom: 6px; }
+  .card-value { font-size: 26px; font-weight: 700; line-height: 1.1; }
+  .card-sub   { font-size: 11px; color: var(--muted); margin-top: 4px; }
+  .charts { display: grid; grid-template-columns: repeat(auto-fill, minmax(380px, 1fr)); gap: 14px; }
+  .chart-card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px; }
+  .chart-title {
+    font-size: 12px; font-weight: 600; color: var(--muted); text-transform: uppercase;
+    letter-spacing: .6px; margin-bottom: 10px;
+  }
+  /* horizontal bars (browsers, OS) */
+  .hbar { display: grid; grid-template-columns: 130px 1fr 70px; align-items: center; gap: 8px; margin: 4px 0; }
+  .hbar-bg { background: var(--bg); border-radius: 3px; height: 14px; overflow: hidden; }
+  .hbar-fill { height: 100%; border-radius: 3px; transition: width .5s ease; }
+  .hbar-num { text-align: right; color: var(--muted); font-variant-numeric: tabular-nums; }
+  /* columns (new devices per hour) */
+  .cols { display: flex; align-items: flex-end; gap: 2px; height: 160px; border-bottom: 1px solid var(--border); }
+  .col { flex: 1; background: var(--purple); border-radius: 2px 2px 0 0; min-width: 3px; }
+  .cols-axis { display: flex; justify-content: space-between; font-size: 11px; color: var(--muted); margin-top: 4px; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th, td { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  th { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .6px; font-weight: 600; }
+  td.ua { white-space: normal; color: var(--muted); word-break: break-all; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .empty { color: var(--muted); padding: 8px 0; }
+  @media (max-width: 600px) {
+    .charts { grid-template-columns: 1fr; }
+    .gauges { grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1><span id="status-dot"></span>10mila — Online statistics</h1>
+  <div id="meta">Loading…</div>
+</header>
+
+<main>
+  <div class="section-title">Devices on the online results <a href="healthcheck.html" style="float:right;font-weight:400;text-transform:none;color:var(--blue);text-decoration:none">System health →</a></div>
+  <div class="gauges">
+    <div class="card">
+      <div class="card-label">Unique devices</div>
+      <div class="card-value" id="v-devices">—</div>
+      <div class="card-sub" id="s-devices">since —</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Active (5 min)</div>
+      <div class="card-value" id="v-active">—</div>
+      <div class="card-sub">page load in the last 5 min</div>
+    </div>
+    <div class="card">
+      <div class="card-label">New (last hour)</div>
+      <div class="card-value" id="v-new">—</div>
+      <div class="card-sub" id="s-new">first seen in the last 60 min</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Page loads</div>
+      <div class="card-value" id="v-hits">—</div>
+      <div class="card-sub" id="s-hits">— per device</div>
+    </div>
+  </div>
+
+  <div class="charts">
+    <div class="chart-card"><div class="chart-title">Browsers</div><div id="browsers"></div></div>
+    <div class="chart-card"><div class="chart-title">Operating systems</div><div id="systems"></div></div>
+    <div class="chart-card" style="grid-column: 1 / -1">
+      <div class="chart-title">New devices per hour</div>
+      <div class="cols" id="per-hour"></div>
+      <div class="cols-axis"><span id="ph-first"></span><span id="ph-max"></span><span id="ph-last"></span></div>
+    </div>
+  </div>
+
+  <div class="section-title">Latest devices</div>
+  <div class="chart-card">
+    <table>
+      <thead><tr><th>Last seen</th><th>First seen</th><th class="num">Loads</th><th>Device</th><th>User agent</th></tr></thead>
+      <tbody id="latest"></tbody>
+    </table>
+  </div>
+</main>
+
+<script>
+const JSON_URL   = 'statistics.json';
+const REFRESH_MS = 5000;
+const LATEST_N   = 50;
+const UA_CUT     = 110;
+const COLORS     = ['#0969da', '#1a7f37', '#8250df', '#bc4c00', '#0598a8', '#9a6700', '#cf222e', '#57606a'];
+
+const $ = id => document.getElementById(id);
+const fmtTime = s => new Date(s * 1000).toLocaleTimeString('sv-SE', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+const fmtDay  = s => new Date(s * 1000).toLocaleString('sv-SE', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+const fmtNum  = n => n.toLocaleString('sv-SE');
+
+function el(tag, attrs, text) {
+  const e = document.createElement(tag);
+  Object.assign(e, attrs || {});
+  if (text !== undefined) e.textContent = text;   // user agents are text, never HTML
+  return e;
+}
+
+function bars(target, counts, total) {
+  const box = $(target);
+  box.replaceChildren();
+  const rows = Object.entries(counts || {});
+  if (!rows.length) { box.append(el('div', { className: 'empty' }, 'No devices yet')); return; }
+  rows.slice(0, 8).forEach(([name, n], i) => {
+    const pct = total ? 100 * n / total : 0;
+    const row = el('div', { className: 'hbar' });
+    const bg  = el('div', { className: 'hbar-bg' });
+    const fill = el('div', { className: 'hbar-fill' });
+    fill.style.width = pct.toFixed(1) + '%';
+    fill.style.background = COLORS[i % COLORS.length];
+    bg.append(fill);
+    row.append(el('div', {}, name), bg, el('div', { className: 'hbar-num' }, `${fmtNum(n)} · ${pct.toFixed(0)}%`));
+    box.append(row);
+  });
+}
+
+function perHour(counts) {
+  const box = $('per-hour');
+  box.replaceChildren();
+  const keys = Object.keys(counts || {}).sort();
+  if (!keys.length) { ['ph-first', 'ph-max', 'ph-last'].forEach(id => $(id).textContent = ''); return; }
+  // Fill hours without new devices, so the time axis is even (at most the last 72 h).
+  const first = Date.parse(keys[0]) / 1000, last = Date.parse(keys[keys.length - 1]) / 1000;
+  const hours = [];
+  for (let t = Math.max(first, last - 71 * 3600); t <= last; t += 3600) {
+    const k = new Date(t * 1000).toISOString().slice(0, 13) + ':00:00Z';
+    hours.push([t, counts[k] || 0]);
+  }
+  const max = Math.max(...hours.map(h => h[1]), 1);
+  hours.forEach(([t, n]) => {
+    const c = el('div', { className: 'col', title: `${fmtDay(t)}: ${n} new` });
+    c.style.height = (100 * n / max) + '%';
+    box.append(c);
+  });
+  $('ph-first').textContent = fmtDay(hours[0][0]);
+  $('ph-max').textContent   = `max ${fmtNum(max)} / h`;
+  $('ph-last').textContent  = fmtDay(hours[hours.length - 1][0]);
+}
+
+function latest(list) {
+  const body = $('latest');
+  body.replaceChildren();
+  const rows = Object.entries(list || {}).sort((a, b) => b[1].last - a[1].last).slice(0, LATEST_N);
+  if (!rows.length) { const tr = el('tr'); tr.append(el('td', { colSpan: 5, className: 'empty' }, 'No devices yet')); body.append(tr); return; }
+  rows.forEach(([uid, d]) => {
+    const ua = d.ua || '(no user agent)';
+    const tr = el('tr');
+    tr.append(el('td', {}, fmtTime(d.last)), el('td', {}, fmtDay(d.first)),
+              el('td', { className: 'num' }, fmtNum(d.hits)), el('td', {}, uid.slice(0, 8)),
+              el('td', { className: 'ua', title: ua }, ua.length > UA_CUT ? ua.slice(0, UA_CUT) + '…' : ua));
+    body.append(tr);
+  });
+}
+
+let lastGen = null;
+async function poll() {
+  try {
+    const resp = await fetch(JSON_URL + '?_=' + Date.now());
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const s = await resp.json();
+    $('status-dot').style.background = 'var(--green)';
+    $('meta').innerHTML = `${new Date(s.generated * 1000).toLocaleString('sv-SE')}<br>refresh ${REFRESH_MS / 1000} s`;
+    if (s.generated === lastGen) return;
+    lastGen = s.generated;
+
+    const devs = Object.values(s.list || {});
+    const hits = devs.reduce((a, d) => a + d.hits, 0);
+    $('v-devices').textContent = fmtNum(s.devices);
+    $('s-devices').textContent = 'since ' + fmtDay(s.since);
+    $('v-active').textContent  = fmtNum(devs.filter(d => d.last >= s.generated - 300).length);
+    $('v-new').textContent     = fmtNum(devs.filter(d => d.first >= s.generated - 3600).length);
+    $('v-hits').textContent    = fmtNum(hits);
+    $('s-hits').textContent    = (s.devices ? (hits / s.devices).toFixed(1) : '—') + ' per device';
+    bars('browsers', s.by_browser, s.devices);
+    bars('systems',  s.by_os,      s.devices);
+    perHour(s.new_per_hour);
+    latest(s.list);
+  } catch (err) {
+    $('status-dot').style.background = 'var(--red)';
+    $('meta').textContent = 'ERROR: ' + err.message;
+  }
+}
+
+poll();
+setInterval(poll, REFRESH_MS);
+</script>
+</body>
+</html>

@@ -59,7 +59,9 @@ info "Installing collector to $INSTALL_DIR ..."
 mkdir -p "$INSTALL_DIR"
 cp "$SCRIPT_DIR/collector.py" "$INSTALL_DIR/"
 chmod 755 "$INSTALL_DIR/collector.py"
-[[ -f "$SCRIPT_DIR/healthcheck.html" ]] && cp "$SCRIPT_DIR/healthcheck.html" "$INSTALL_DIR/"
+for page in healthcheck.html statistics.html; do
+    if [[ -f "$SCRIPT_DIR/$page" ]]; then cp "$SCRIPT_DIR/$page" "$INSTALL_DIR/"; fi
+done
 chown -R root:root "$INSTALL_DIR"
 
 # ─── Config ───────────────────────────────────────────────────────────────────
@@ -132,6 +134,12 @@ probe_timeout_s = 3
 # leave both empty to switch the web statistics off.
 nginx_url     = http://127.0.0.1:8080/nginx_status
 fpm_url       = http://127.0.0.1:8080/fpm_status
+
+[devices]
+# Unique devices on the online results site -> statistics.json and statistics.html. Web server only:
+# nginx sends one syslog datagram per HTML page load to this unix socket. Empty = off.
+socket          =
+statistics_file = statistics.json
 EOF
     chmod 640 "$CONFIG_FILE"
     chown root:"$SERVICE_USER" "$CONFIG_FILE"
@@ -179,16 +187,17 @@ EOF
 info "Registered tmpfiles.d entry: $TMPFILES_CONF"
 
 # ─── Install HTML dashboard ───────────────────────────────────────────────────
-if [[ -f "$SCRIPT_DIR/healthcheck.html" ]]; then
-    # Copy to the built-in HTTP server root (tmpfs, re-created on each install/reboot).
-    # /etc/tmpfiles.d ensures the directory exists after reboot; the service
-    # recreates it too, but the HTML must be installed again after a reboot.
-    info "Copying healthcheck.html to $OUTPUT_DIR ..."
+# Copy to the built-in HTTP server root (tmpfs, re-created on each install/reboot).
+# /etc/tmpfiles.d ensures the directory exists after reboot; the service
+# copies the pages again on every start (ExecStartPre).
+for page in healthcheck.html statistics.html; do
+    [[ -f "$SCRIPT_DIR/$page" ]] || continue
+    info "Copying $page to $OUTPUT_DIR ..."
     mkdir -p "$OUTPUT_DIR"
-    cp "$SCRIPT_DIR/healthcheck.html" "$OUTPUT_DIR/"
-    chown "$SERVICE_USER":"$SERVICE_USER" "$OUTPUT_DIR/healthcheck.html"
-    chmod 644 "$OUTPUT_DIR/healthcheck.html"
-fi
+    cp "$SCRIPT_DIR/$page" "$OUTPUT_DIR/"
+    chown "$SERVICE_USER":"$SERVICE_USER" "$OUTPUT_DIR/$page"
+    chmod 644 "$OUTPUT_DIR/$page"
+done
 
 # ─── systemd service ─────────────────────────────────────────────────────────
 info "Installing systemd service..."

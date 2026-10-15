@@ -1093,6 +1093,186 @@ def publish_copy(data: dict, publish_dir: str, filename: str) -> None:
         print(f"[sysmon] WARNING: could not publish copy to {publish_dir}: {e}", flush=True)
 
 
+# ─── Device counter (online results server only) ─────────────────────────────
+# nginx gives every browser a cookie (ngx_http_userid_module) and sends one syslog datagram per HTML
+# page load to a unix socket:  <190>Oct 15 20:13:00 tmdev: tmdev=<32 hex>\t<unix s.ms>\t<user agent>
+# (user agent JSON-escaped, may be empty). Counted in memory, written as statistics.json.
+
+DEVICES_MAX = 50000   # ponytail: ceiling on devices kept (~25 MB RAM, ~10 MB JSON); new ones beyond are not counted
+UA_MAX      = 400     # longer user agents are cut
+
+_BOT_RE = re.compile(r"bot|crawl|spider|slurp|curl|wget|python|httpclient|okhttp|go-http|java/|headless|lighthouse", re.I)
+
+
+def parse_device_datagram(data: bytes):
+    """One nginx syslog datagram -> (uid, unix seconds, user agent), or None if malformed."""
+    try:
+        msg = data.decode("utf-8", "replace").rstrip("\r\n")
+        if msg.startswith("<"):                     # syslog header: <PRI>Mmm dd hh:mm:ss tag:
+            cut = msg.find(": ")
+            if cut < 0:
+                return None
+            msg = msg[cut + 2:]
+        parts = msg.split("\t", 2)
+        if len(parts) != 3:
+            return None
+        uid, ts, ua = parts
+        if uid.startswith("tmdev="):
+            uid = uid[6:]
+        if not re.fullmatch(r"[0-9A-Fa-f]{32}", uid):
+            return None
+        ts = float(ts)
+        if not 1e9 < ts < 1e10:                     # also rejects nan/inf
+            return None
+        try:
+            ua = json.loads('"' + ua + '"')         # undo log_format escape=json
+        except ValueError:
+            pass
+        return uid.upper(), round(ts, 3), ua[:UA_MAX]
+    except (ValueError, UnicodeError):
+        return None
+
+
+def ua_family(ua: str) -> tuple[str, str]:
+    """(browser, os) from a user agent, by substring; good enough for a pie, not for a fingerprint."""
+    if not ua:
+        return "Unknown", "Unknown"
+    if _BOT_RE.search(ua):
+        browser = "Bot"
+    elif any(s in ua for s in ("Edg/", "EdgA/", "EdgiOS/", "Edge/")):
+        browser = "Edge"
+    elif "OPR/" in ua or "Opera" in ua:
+        browser = "Opera"
+    elif "SamsungBrowser/" in ua:
+        browser = "Samsung Internet"
+    elif "FBAN" in ua or "FBAV" in ua:
+        browser = "Facebook"
+    elif "Instagram" in ua:
+        browser = "Instagram"
+    elif "Firefox/" in ua or "FxiOS/" in ua:
+        browser = "Firefox"
+    elif "CriOS/" in ua or "Chrome/" in ua or "Chromium/" in ua:
+        browser = "Chrome"
+    elif "Safari/" in ua:
+        browser = "Safari"
+    else:
+        browser = "Other"
+    if any(s in ua for s in ("iPhone", "iPad", "iPod")):
+        os_ = "iOS"
+    elif "Android" in ua:
+        os_ = "Android"
+    elif "Windows" in ua:
+        os_ = "Windows"
+    elif "CrOS" in ua:
+        os_ = "ChromeOS"
+    elif "Macintosh" in ua or "Mac OS X" in ua:
+        os_ = "macOS"
+    elif "Linux" in ua or "X11" in ua:
+        os_ = "Linux"
+    else:
+        os_ = "Other"
+    return browser, os_
+
+
+class DeviceCounter:
+    """Receives the nginx datagrams and writes statistics.json every interval."""
+
+    def __init__(self, sock_path: str, out_path: str, interval: int) -> None:
+        self.sock_path, self.out_path, self.interval = sock_path, out_path, interval
+        self.lock    = threading.Lock()
+        self.devices: dict = {}
+        self.since   = round(time.time(), 3)
+        self.dirty   = True
+        # A restart keeps the count (tmpfs: gone after a reboot, like healthcheck.json's history).
+        try:
+            with open(out_path) as f:
+                old = json.load(f)
+            for uid, d in old.get("list", {}).items():
+                if len(self.devices) < DEVICES_MAX and re.fullmatch(r"[0-9A-F]{32}", uid):
+                    self.devices[uid] = {"ua": str(d["ua"])[:UA_MAX], "first": float(d["first"]),
+                                         "last": float(d["last"]), "hits": int(d["hits"])}
+            self.since = float(old.get("since", self.since))
+            print(f"[sysmon] devices: restored {len(self.devices)}", flush=True)
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            pass
+
+    def add(self, uid: str, ts: float, ua: str) -> None:
+        with self.lock:
+            d = self.devices.get(uid)
+            if d is None:
+                if len(self.devices) >= DEVICES_MAX:
+                    return
+                self.devices[uid] = {"ua": ua, "first": ts, "last": ts, "hits": 1}
+            else:
+                d["hits"] += 1
+                d["first"], d["last"] = min(d["first"], ts), max(d["last"], ts)
+                if ua:
+                    d["ua"] = ua
+            self.dirty = True
+
+    def snapshot(self) -> dict:
+        with self.lock:
+            devices = {uid: dict(d) for uid, d in self.devices.items()}
+        browsers: dict = {}
+        systems:  dict = {}
+        per_hour: dict = {}
+        for d in devices.values():
+            b, o = ua_family(d["ua"])
+            browsers[b] = browsers.get(b, 0) + 1
+            systems[o]  = systems.get(o, 0) + 1
+            h = datetime.fromtimestamp(d["first"] - d["first"] % 3600, timezone.utc).strftime("%Y-%m-%dT%H:00:00Z")
+            per_hour[h] = per_hour.get(h, 0) + 1
+        by_count = lambda c: dict(sorted(c.items(), key=lambda kv: (-kv[1], kv[0])))
+        return {
+            "generated":    round(time.time(), 3),
+            "since":        self.since,
+            "devices":      len(devices),
+            "by_browser":   by_count(browsers),
+            "by_os":        by_count(systems),
+            "new_per_hour": dict(sorted(per_hour.items())),
+            "list":         devices,
+        }
+
+    def _receive(self) -> None:
+        while True:
+            try:
+                try:
+                    os.unlink(self.sock_path)          # left over from the last run
+                except FileNotFoundError:
+                    pass
+                s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+                s.bind(self.sock_path)
+                os.chmod(self.sock_path, 0o666)        # nginx workers run as another user
+                print(f"[sysmon] devices: listening on {self.sock_path}", flush=True)
+                break
+            except OSError as e:
+                print(f"[sysmon] devices: cannot bind {self.sock_path}: {e}; retrying", flush=True)
+                time.sleep(30)
+        while True:
+            try:
+                rec = parse_device_datagram(s.recv(65536))
+                if rec:
+                    self.add(*rec)
+            except Exception as e:                     # never let one datagram stop the counter
+                print(f"[sysmon] devices: {e}", flush=True)
+                time.sleep(0.1)
+
+    def _write(self) -> None:
+        while True:
+            if self.dirty:
+                self.dirty = False
+                try:
+                    write_json(self.out_path, self.snapshot())
+                except Exception as e:
+                    self.dirty = True
+                    print(f"[sysmon] ERROR writing {self.out_path}: {e}", flush=True)
+            time.sleep(self.interval)
+
+    def start(self) -> None:
+        threading.Thread(target=self._receive, daemon=True).start()
+        threading.Thread(target=self._write,   daemon=True).start()
+
+
 # ─── Config ───────────────────────────────────────────────────────────────────
 
 def load_config(path: str) -> configparser.ConfigParser:
@@ -1135,6 +1315,37 @@ def selftest() -> None:
     assert m._judge({"b": "5000000"}, {**up, "delay_us": "6200"})["jitter_ms"] == 1.0
     r = m._judge({"b": "5000000"}, {"io": "CONNECTING", "sql": "ON", "delay_us": "NULL"})
     assert r["ok"] is False and r["delay_ms"] is None and "I/O CONNECTING" in r["reason"]
+    # Device counter: nginx syslog datagrams and user agent families.
+    uid = "0123456789abcdef0123456789ABCDEF"
+    iphone = r"Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1"
+    assert parse_device_datagram(f"<190>Oct 15 20:13:00 tmdev: tmdev={uid}\t1760551980.123\t{iphone}".encode()) \
+        == (uid.upper(), 1760551980.123, iphone)
+    assert parse_device_datagram(f"tmdev={uid}\t1760551980.5\t".encode()) == (uid.upper(), 1760551980.5, "")
+    assert parse_device_datagram(f"<190>Oct  5 01:02:03 tmdev: tmdev={uid}\t1760551980\ta \\\"b\\\" \\u00e5".encode())[2] == 'a "b" \u00e5'
+    for bad in (b"", b"garbage", b"<190>no header", f"tmdev={uid}\t1760551980".encode(),
+                f"tmdev=\t1760551980\tx".encode(), f"tmdev={uid[:-1]}\t1760551980\tx".encode(),
+                f"tmdev={uid}\tnan\tx".encode(), f"tmdev={uid}\t-\tx".encode(), b"\xff\xfe\x00"):
+        assert parse_device_datagram(bad) is None, bad
+    assert ua_family(iphone) == ("Safari", "iOS")
+    assert ua_family("Mozilla/5.0 (Linux; Android 14; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) "
+                     "SamsungBrowser/25.0 Chrome/121.0.0.0 Mobile Safari/537.36") == ("Samsung Internet", "Android")
+    assert ua_family("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+                     "Chrome/129.0.0.0 Safari/537.36 Edg/129.0.0.0") == ("Edge", "Windows")
+    assert ua_family("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+                     "Chrome/129.0.0.0 Safari/537.36") == ("Chrome", "Windows")
+    assert ua_family("Mozilla/5.0 (Macintosh; Intel Mac OS X 14.5; rv:131.0) Gecko/20100101 Firefox/131.0") == ("Firefox", "macOS")
+    assert ua_family("Mozilla/5.0 (X11; Linux x86_64; rv:131.0) Gecko/20100101 Firefox/131.0") == ("Firefox", "Linux")
+    assert ua_family("Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)")[0] == "Bot"
+    assert ua_family("curl/8.5.0") == ("Bot", "Other") and ua_family("") == ("Unknown", "Unknown")
+    dc = DeviceCounter("", "/nonexistent/statistics.json", 5)
+    dc.add(uid.upper(), 1760551980.0, iphone)
+    dc.add(uid.upper(), 1760551990.0, "")                      # empty UA keeps the known one
+    dc.add("F" * 32, 1760555600.0, "curl/8.5.0")
+    st = dc.snapshot()
+    assert st["devices"] == 2 and st["list"][uid.upper()] == {"ua": iphone, "first": 1760551980.0,
+                                                              "last": 1760551990.0, "hits": 2}
+    assert st["by_browser"] == {"Bot": 1, "Safari": 1} and st["by_os"] == {"Other": 1, "iOS": 1}
+    assert st["new_per_hour"] == {"2025-10-15T18:00:00Z": 1, "2025-10-15T19:00:00Z": 1}, st["new_per_hour"]
     print("selftest ok")
 
 
@@ -1173,6 +1384,8 @@ def main() -> None:
     probe_timeout = cfg.getfloat("tunnel", "probe_timeout_s", fallback=3.0)
     nginx_url    = cfg.get   ("web",      "nginx_url",    fallback="http://127.0.0.1:8080/nginx_status")
     fpm_url      = cfg.get   ("web",      "fpm_url",      fallback="http://127.0.0.1:8080/fpm_status")
+    devices_sock = cfg.get   ("devices",  "socket",       fallback="")   # empty = no device counter
+    devices_file = cfg.get   ("devices",  "statistics_file", fallback="statistics.json")
 
     output_path  = os.path.join(output_dir, output_file)
     link_name    = output_file
@@ -1185,6 +1398,9 @@ def main() -> None:
         # Ensure the output dir exists before the HTTP server thread starts
         os.makedirs(output_dir, exist_ok=True)
         start_http_server(output_dir, http_port)
+
+    if devices_sock:
+        DeviceCounter(devices_sock, os.path.join(output_dir, devices_file), interval).start()
 
     cpu_mon  = CpuMonitor()
     disk_mon = DiskMonitor()
