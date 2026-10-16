@@ -96,6 +96,9 @@ publish_dir   =
 # Set to false if lsof is too slow on this system
 lsof_enabled  = true
 
+# The server's role, shown as the banner on healthcheck.html (blank = "System Health")
+role          =
+
 [mysql]
 # Path to MySQL option file with [client] user/password
 defaults_file = /etc/10mila-sysmon/mysql.cnf

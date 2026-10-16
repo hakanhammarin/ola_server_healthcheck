@@ -144,7 +144,7 @@
 <body>
 
 <header>
-  <h1><span id="status-dot"></span>10mila — System Health</h1>
+  <h1><span id="status-dot"></span>10mila — <span id="role">System Health</span></h1>
   <div id="meta">Loading…</div>
 </header>
 
@@ -627,6 +627,7 @@ function updateGauges(d) {
 
   // ── Header
   document.getElementById('status-dot').style.background = 'var(--green)';
+  if (meta.role) { document.getElementById('role').textContent = meta.role; document.title = `10mila — ${meta.role}`; }
   document.getElementById('meta').innerHTML =
     `<b>${meta.hostname}</b> &nbsp;·&nbsp; ${fmtTs(d.collected_at)}<br>` +
     `interval ${meta.interval_s}s &nbsp;·&nbsp; ${hist.timestamps.length} samples`;

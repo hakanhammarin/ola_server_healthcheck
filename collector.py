@@ -1385,6 +1385,7 @@ def main() -> None:
     services_file = cfg.get  ("monitor",  "services_file", fallback=SERVICES_FILE)
     http_port    = cfg.getint("monitor",  "http_port",     fallback=HTTP_PORT)
     lsof_enabled = cfg.getboolean("monitor", "lsof_enabled", fallback=LSOF_ENABLED)
+    role         = cfg.get   ("monitor",  "role",         fallback="")   # banner on healthcheck.html
     mysql_cfg    = cfg.get   ("mysql",    "defaults_file",fallback=MYSQL_DEFAULTS_FILE)
     mysql_host   = cfg.get   ("mysql",    "host",         fallback=MYSQL_HOST)
     mysql_port   = cfg.get   ("mysql",    "port",         fallback=MYSQL_PORT)
@@ -1462,6 +1463,7 @@ def main() -> None:
             "meta": {
                 "version":        "1.1",
                 "hostname":       hostname,
+                "role":           role,
                 "collected_at":   ts_iso,
                 "interval_s":     interval,
                 "history_samples": history_size,
