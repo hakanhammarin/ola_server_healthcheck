@@ -59,7 +59,7 @@ info "Installing collector to $INSTALL_DIR ..."
 mkdir -p "$INSTALL_DIR"
 cp "$SCRIPT_DIR/collector.py" "$INSTALL_DIR/"
 chmod 755 "$INSTALL_DIR/collector.py"
-for page in healthcheck.html statistics.html; do
+for page in healthcheck.html statistics.html chart.umd.min.js; do
     if [[ -f "$SCRIPT_DIR/$page" ]]; then cp "$SCRIPT_DIR/$page" "$INSTALL_DIR/"; fi
 done
 chown -R root:root "$INSTALL_DIR"
@@ -193,7 +193,7 @@ info "Registered tmpfiles.d entry: $TMPFILES_CONF"
 # Copy to the built-in HTTP server root (tmpfs, re-created on each install/reboot).
 # /etc/tmpfiles.d ensures the directory exists after reboot; the service
 # copies the pages again on every start (ExecStartPre).
-for page in healthcheck.html statistics.html; do
+for page in healthcheck.html statistics.html chart.umd.min.js; do
     [[ -f "$SCRIPT_DIR/$page" ]] || continue
     info "Copying $page to $OUTPUT_DIR ..."
     mkdir -p "$OUTPUT_DIR"

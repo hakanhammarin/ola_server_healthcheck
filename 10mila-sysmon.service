@@ -9,6 +9,7 @@ Type=simple
 ExecStartPre=/bin/mkdir -p /dev/shm/10mila-sysmon
 ExecStartPre=-/bin/cp /opt/10mila-sysmon/healthcheck.html /dev/shm/10mila-sysmon/healthcheck.html
 ExecStartPre=-/bin/cp /opt/10mila-sysmon/statistics.html /dev/shm/10mila-sysmon/statistics.html
+ExecStartPre=-/bin/cp /opt/10mila-sysmon/chart.umd.min.js /dev/shm/10mila-sysmon/chart.umd.min.js
 ExecStart=/usr/bin/python3 /opt/10mila-sysmon/collector.py --config /etc/10mila-sysmon/config.ini
 Restart=always
 RestartSec=5
