@@ -107,6 +107,8 @@
   <div class="charts">
     <div class="chart-card"><div class="chart-title">Browsers</div><div id="browsers"></div></div>
     <div class="chart-card"><div class="chart-title">Operating systems</div><div id="systems"></div></div>
+    <div class="chart-card" style="grid-column: 1 / -1"><div class="chart-title">Countries (devices, -- = unknown)</div><div id="countries"></div>
+      <div class="card-sub">IP geolocation by <a href="https://db-ip.com" style="color:var(--blue)">DB-IP</a> (CC BY 4.0); the address itself is never sent here</div></div>
     <div class="chart-card" style="grid-column: 1 / -1">
       <div class="chart-title">New devices per hour</div>
       <div class="cols" id="per-hour"></div>
@@ -117,7 +119,7 @@
   <div class="section-title">Latest devices</div>
   <div class="chart-card">
     <table>
-      <thead><tr><th>Last seen</th><th>First seen</th><th class="num">Loads</th><th>Device</th><th>User agent</th></tr></thead>
+      <thead><tr><th>Last seen</th><th>First seen</th><th class="num">Loads</th><th>Country</th><th>Device</th><th>User agent</th></tr></thead>
       <tbody id="latest"></tbody>
     </table>
   </div>
@@ -142,12 +144,12 @@ function el(tag, attrs, text) {
   return e;
 }
 
-function bars(target, counts, total) {
+function bars(target, counts, total, max = 8) {
   const box = $(target);
   box.replaceChildren();
   const rows = Object.entries(counts || {});
   if (!rows.length) { box.append(el('div', { className: 'empty' }, 'No devices yet')); return; }
-  rows.slice(0, 8).forEach(([name, n], i) => {
+  rows.slice(0, max).forEach(([name, n], i) => {
     const pct = total ? 100 * n / total : 0;
     const row = el('div', { className: 'hbar' });
     const bg  = el('div', { className: 'hbar-bg' });
@@ -187,12 +189,12 @@ function latest(list) {
   const body = $('latest');
   body.replaceChildren();
   const rows = Object.entries(list || {}).sort((a, b) => b[1].last - a[1].last).slice(0, LATEST_N);
-  if (!rows.length) { const tr = el('tr'); tr.append(el('td', { colSpan: 5, className: 'empty' }, 'No devices yet')); body.append(tr); return; }
+  if (!rows.length) { const tr = el('tr'); tr.append(el('td', { colSpan: 6, className: 'empty' }, 'No devices yet')); body.append(tr); return; }
   rows.forEach(([uid, d]) => {
     const ua = d.ua || '(no user agent)';
     const tr = el('tr');
     tr.append(el('td', {}, fmtTime(d.last)), el('td', {}, fmtDay(d.first)),
-              el('td', { className: 'num' }, fmtNum(d.hits)), el('td', {}, uid.slice(0, 8)),
+              el('td', { className: 'num' }, fmtNum(d.hits)), el('td', {}, d.cc || '--'), el('td', {}, uid.slice(0, 8)),
               el('td', { className: 'ua', title: ua }, ua.length > UA_CUT ? ua.slice(0, UA_CUT) + '…' : ua));
     body.append(tr);
   });
@@ -220,6 +222,7 @@ async function poll() {
     $('s-bots').textContent    = `+ ${fmtNum(s.bot_hits || 0)} by bots (not counted)`;
     bars('browsers', s.by_browser, s.devices);
     bars('systems',  s.by_os,      s.devices);
+    bars('countries', s.by_country, s.devices, 12);
     perHour(s.new_per_hour);
     latest(s.list);
   } catch (err) {

@@ -1095,8 +1095,9 @@ def publish_copy(data: dict, publish_dir: str, filename: str) -> None:
 
 # ─── Device counter (online results server only) ─────────────────────────────
 # nginx gives every browser a cookie (ngx_http_userid_module) and sends one syslog datagram per HTML
-# page load to a unix socket:  <190>Oct 15 20:13:00 tmdev: tmdev=<32 hex>\t<unix s.ms>\t<user agent>
-# (user agent JSON-escaped, may be empty). Counted in memory, written as statistics.json.
+# page load to a unix socket:  <190>Oct 15 20:13:00 tmdev: tmdev=<32 hex>\t<unix s.ms>\t<CC>\t<user agent>
+# (CC = country from nginx's geo module, "--" if unknown, absent in the older 3-field form; user agent
+# JSON-escaped, may be empty; escape=json never lets a raw tab into it, so the field count is unambiguous). Counted in memory, written as statistics.json.
 
 DEVICES_MAX = 50000   # ponytail: ceiling on devices kept (~25 MB RAM, ~10 MB JSON); new ones beyond are not counted
 UA_MAX      = 400     # longer user agents are cut
@@ -1105,7 +1106,7 @@ _BOT_RE = re.compile(r"bot|crawl|spider|slurp|curl|wget|python|httpclient|okhttp
 
 
 def parse_device_datagram(data: bytes):
-    """One nginx syslog datagram -> (uid, unix seconds, user agent), or None if malformed."""
+    """One nginx syslog datagram -> (uid, unix seconds, user agent, country), or None if malformed."""
     try:
         msg = data.decode("utf-8", "replace").rstrip("\r\n")
         if msg.startswith("<"):                     # syslog header: <PRI>Mmm dd hh:mm:ss tag:
@@ -1113,10 +1114,15 @@ def parse_device_datagram(data: bytes):
             if cut < 0:
                 return None
             msg = msg[cut + 2:]
-        parts = msg.split("\t", 2)
-        if len(parts) != 3:
+        parts = msg.split("\t")
+        if len(parts) == 3:
+            (uid, ts, ua), cc = parts, "--"
+        elif len(parts) == 4:
+            uid, ts, cc, ua = parts
+            if not re.fullmatch(r"[A-Z]{2}|--", cc):
+                cc = "--"
+        else:
             return None
-        uid, ts, ua = parts
         if uid.startswith("tmdev="):
             uid = uid[6:]
         if not re.fullmatch(r"[0-9A-Fa-f]{32}", uid):
@@ -1128,7 +1134,7 @@ def parse_device_datagram(data: bytes):
             ua = json.loads('"' + ua + '"')         # undo log_format escape=json
         except ValueError:
             pass
-        return uid.upper(), round(ts, 3), ua[:UA_MAX]
+        return uid.upper(), round(ts, 3), ua[:UA_MAX], cc
     except (ValueError, UnicodeError):
         return None
 
@@ -1192,14 +1198,15 @@ class DeviceCounter:
                 if len(self.devices) < DEVICES_MAX and re.fullmatch(r"[0-9A-F]{32}", uid) \
                         and ua_family(str(d["ua"]))[0] != "Bot":
                     self.devices[uid] = {"ua": str(d["ua"])[:UA_MAX], "first": float(d["first"]),
-                                         "last": float(d["last"]), "hits": int(d["hits"])}
+                                         "last": float(d["last"]), "hits": int(d["hits"]),
+                                         "cc": str(d.get("cc", "--"))[:2]}
             self.since = float(old.get("since", self.since))
             self.bot_hits = int(old.get("bot_hits", 0))
             print(f"[sysmon] devices: restored {len(self.devices)}", flush=True)
         except (OSError, ValueError, KeyError, TypeError, AttributeError):
             pass
 
-    def add(self, uid: str, ts: float, ua: str) -> None:
+    def add(self, uid: str, ts: float, ua: str, cc: str = "--") -> None:
         bot = ua_family(ua)[0] == "Bot"
         with self.lock:
             self.dirty = True
@@ -1210,12 +1217,14 @@ class DeviceCounter:
             if d is None:
                 if len(self.devices) >= DEVICES_MAX:
                     return
-                self.devices[uid] = {"ua": ua, "first": ts, "last": ts, "hits": 1}
+                self.devices[uid] = {"ua": ua, "first": ts, "last": ts, "hits": 1, "cc": cc}
             else:
                 d["hits"] += 1
                 d["first"], d["last"] = min(d["first"], ts), max(d["last"], ts)
                 if ua:
                     d["ua"] = ua
+                if cc != "--":
+                    d["cc"] = cc                       # last known country
 
     def snapshot(self) -> dict:
         with self.lock:
@@ -1224,7 +1233,10 @@ class DeviceCounter:
         browsers: dict = {}
         systems:  dict = {}
         per_hour: dict = {}
+        countries: dict = {}
         for d in devices.values():
+            cc = d.get("cc", "--")
+            countries[cc] = countries.get(cc, 0) + 1
             b, o = ua_family(d["ua"])
             browsers[b] = browsers.get(b, 0) + 1
             systems[o]  = systems.get(o, 0) + 1
@@ -1238,6 +1250,7 @@ class DeviceCounter:
             "bot_hits":     bot_hits,
             "by_browser":   by_count(browsers),
             "by_os":        by_count(systems),
+            "by_country":   by_count(countries),
             "new_per_hour": dict(sorted(per_hour.items())),
             "list":         devices,
         }
@@ -1328,12 +1341,17 @@ def selftest() -> None:
     uid = "0123456789abcdef0123456789ABCDEF"
     iphone = r"Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1"
     assert parse_device_datagram(f"<190>Oct 15 20:13:00 tmdev: tmdev={uid}\t1760551980.123\t{iphone}".encode()) \
-        == (uid.upper(), 1760551980.123, iphone)
-    assert parse_device_datagram(f"tmdev={uid}\t1760551980.5\t".encode()) == (uid.upper(), 1760551980.5, "")
+        == (uid.upper(), 1760551980.123, iphone, "--")
+    assert parse_device_datagram(f"<190>Oct 15 20:13:00 tmdev: tmdev={uid}\t1760551980.123\tSE\t{iphone}".encode()) \
+        == (uid.upper(), 1760551980.123, iphone, "SE")
+    assert parse_device_datagram(f"tmdev={uid}\t1760551980.5\t--\t".encode()) == (uid.upper(), 1760551980.5, "", "--")
+    assert parse_device_datagram(f"tmdev={uid}\t1760551980.5\tse<x>\tx".encode())[3] == "--"     # bad country
+    assert parse_device_datagram(f"tmdev={uid}\t1760551980.5\t".encode()) == (uid.upper(), 1760551980.5, "", "--")
     assert parse_device_datagram(f"<190>Oct  5 01:02:03 tmdev: tmdev={uid}\t1760551980\ta \\\"b\\\" \\u00e5".encode())[2] == 'a "b" \u00e5'
     for bad in (b"", b"garbage", b"<190>no header", f"tmdev={uid}\t1760551980".encode(),
                 f"tmdev=\t1760551980\tx".encode(), f"tmdev={uid[:-1]}\t1760551980\tx".encode(),
-                f"tmdev={uid}\tnan\tx".encode(), f"tmdev={uid}\t-\tx".encode(), b"\xff\xfe\x00"):
+                f"tmdev={uid}\tnan\tx".encode(), f"tmdev={uid}\t-\tx".encode(), b"\xff\xfe\x00",
+                f"tmdev={uid}\t1760551980\tSE\tx\ty".encode()):
         assert parse_device_datagram(bad) is None, bad
     assert ua_family(iphone) == ("Safari", "iOS")
     assert ua_family("Mozilla/5.0 (Linux; Android 14; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -1348,13 +1366,15 @@ def selftest() -> None:
     assert ua_family("curl/8.5.0") == ("Bot", "Other") and ua_family("") == ("Unknown", "Unknown")
     dc = DeviceCounter("", "/nonexistent/statistics.json", 5)
     dc.add(uid.upper(), 1760551980.0, iphone)
-    dc.add(uid.upper(), 1760551990.0, "")                      # empty UA keeps the known one
+    dc.add(uid.upper(), 1760551985.0, iphone, "NO")
+    dc.add(uid.upper(), 1760551990.0, "")                      # empty UA and unknown country keep the known ones
     dc.add("F" * 32, 1760555600.0, "curl/8.5.0")              # bots: a hit, never a device
     dc.add("F" * 32, 1760555601.0, "Googlebot/2.1")
     dc.add("E" * 32, 1760555600.0, "")                         # empty UA: counted, as Unknown
     st = dc.snapshot()
     assert st["devices"] == 2 and st["bot_hits"] == 2 and "F" * 32 not in st["list"], st
-    assert st["list"][uid.upper()] == {"ua": iphone, "first": 1760551980.0, "last": 1760551990.0, "hits": 2}
+    assert st["list"][uid.upper()] == {"ua": iphone, "first": 1760551980.0, "last": 1760551990.0, "hits": 3, "cc": "NO"}
+    assert st["by_country"] == {"--": 1, "NO": 1}, st["by_country"]
     assert st["by_browser"] == {"Safari": 1, "Unknown": 1} and st["by_os"] == {"Unknown": 1, "iOS": 1}
     assert st["new_per_hour"] == {"2025-10-15T18:00:00Z": 1, "2025-10-15T19:00:00Z": 1}, st["new_per_hour"]
     with tempfile.TemporaryDirectory() as tmp:                 # a restart keeps the count and drops old bot devices
@@ -1362,6 +1382,7 @@ def selftest() -> None:
         write_json(path, {**st, "list": {**st["list"], "F" * 32: {"ua": "curl/8.5.0", "first": 1e9 + 1, "last": 1e9 + 1, "hits": 9}}})
         st2 = DeviceCounter("", path, 5).snapshot()
         assert st2["devices"] == 2 and st2["bot_hits"] == 2 and st2["since"] == st["since"], st2
+        assert st2["by_country"] == st["by_country"], st2
     print("selftest ok")
 
 
