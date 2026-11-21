@@ -275,6 +275,10 @@
     </div>
   </div>
 
+  <!-- Integrations (utility server only: [integration] in config.ini) -->
+  <div class="section-title int-only" id="int-section-title" style="display:none">Integrations</div>
+  <div class="gauges int-only" id="int-gauges" style="display:none"></div>
+
   <!-- NGINX + PHP-FPM gauges (shown only when nginx is running on this server) -->
   <div class="section-title web-only" id="web-section-title" style="display:none">NGINX / PHP-FPM</div>
   <div class="gauges web-only" id="web-gauges" style="display:none">
@@ -845,6 +849,25 @@ function updateWeb(w) {
   document.getElementById('g-fpm-max').className = 'card' + (fpm.max_children_reached > 0 ? ' status-red' : '');
 }
 
+// Integrations: one box per check, built from d.integration.checks (label, value, sub, ok from the collector).
+function updateIntegration(it) {
+  const show = !!(it && it.checks);
+  document.querySelectorAll('.int-only').forEach(el => { el.style.display = show ? '' : 'none'; });
+  if (!show) return;
+  const esc = v => String(v ?? '').replace(/[&<>"]/g, ch => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;'}[ch]));
+  const age = it.checked_at ? Math.round(Date.now() / 1000 - it.checked_at) : null;
+  document.getElementById('int-section-title').innerHTML = 'Integrations' +
+    (age !== null && age > 120 ? ` <span class="offline-badge">CHECKED ${age}s AGO</span>` : '') +
+    (it.error ? ` <span class="offline-badge">${esc(it.error)}</span>` : '');
+  document.getElementById('int-gauges').innerHTML = it.checks.map(c => {
+    const color = c.ok === true ? 'var(--green)' : c.ok === false ? 'var(--red)' : 'var(--muted)';
+    const cls = c.ok === true ? ' status-green' : c.ok === false ? ' status-red' : '';
+    return `<div class="card${cls}"><div class="card-label">${esc(c.label)}</div>` +
+           `<div class="card-value" style="color:${color}">${esc(c.value)}</div>` +
+           `<div class="card-sub">${esc(c.sub)}</div></div>`;
+  }).join('');
+}
+
 function updateCharts(hist) {
   const labels = trimLabels(hist.timestamps);
 
@@ -922,6 +945,7 @@ async function poll() {
     updateGauges(data);
     updateTunnel(data.ssh_tunnel);
     updateWeb(data.web);
+    updateIntegration(data.integration);
     updateCharts(data.history);
 
   } catch (err) {

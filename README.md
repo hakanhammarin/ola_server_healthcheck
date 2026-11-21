@@ -120,6 +120,29 @@ Times are Unix seconds; `new_per_hour` counts devices by the UTC hour they were 
 restart keeps the count (it reads the old `statistics.json`, dropping any bot found there); a reboot clears it. Malformed datagrams are
 ignored. `python3 collector.py --selftest` checks the datagram parser and the browser/OS families.
 
+## Integrations (utility server)
+
+On a server with an `[integration]` section in `config.ini` (the 10MILA utility server, `sysmon.sh util`) the page gets an
+Integrations row and `services.json` one key per check, each with `available` = healthy. Checks run every `every_s`
+(30 s) in their own thread, so a slow Eventor never delays the system samples.
+
+```ini
+[integration]
+every_s             = 30
+fetchteams_url      = http://127.0.0.1:8095/health.json   # fetchteams; also gives the Eventor URL (path and query dropped)
+peer_url            = http://SERVER01:8082/services.json  # the OLA primary's own healthcheck: role and OLA Java
+mysql_host          = SERVER01                            # SELECT 1 and unapplied zz_teamchanges rows
+mysql_defaults_file = /etc/10mila-sysmon/integration.cnf  # [client] user/password of a read-only account
+mysql_database      = tiomilaprod
+pending_max_age_s   = 300                                 # an unapplied row older than this is ALARM
+fetch_max_age_s     = 300                                 # a running fetchteams with no fetch for this long is ALARM
+http_checks         = search=http://127.0.0.1:8097/ teamtracker=http://127.0.0.1:8099/
+```
+
+Keys: `fetchteams`, `mysql_primary` (ms, role, pending, oldest_pending_s), `ola_primary`, `eventor`, `http_<name>`.
+The MySQL role comes from the primary's healthcheck, so the read-only account needs no REPLICATION CLIENT grant.
+Any HTTP answer below 500 counts as up (a PIN page or a 401 is a live service).
+
 ## File locations
 
 | Path | Description |

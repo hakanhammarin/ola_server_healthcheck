@@ -23,6 +23,8 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.error
+import urllib.parse
 import urllib.request
 from collections import deque
 from datetime import datetime, timezone
@@ -1047,6 +1049,159 @@ def serialise_history(h: dict[str, deque]) -> dict:
     return {k: list(v) for k, v in h.items()}
 
 
+# ─── Integrations (utility server) ───────────────────────────────────────────
+
+def http_probe(url: str, timeout: float = 3.0) -> dict:
+    """GET url: {"code", "ms", "error"}. Any HTTP answer below 500 counts as up (a login page or 401 is a live service)."""
+    t0 = time.monotonic()
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "10mila-sysmon"}),
+                                    timeout=timeout) as r:
+            code, body = r.status, r.read(1_000_000)
+    except urllib.error.HTTPError as e:
+        code, body = e.code, b""
+    except Exception as e:                                       # refused, timeout, TLS, DNS
+        return {"code": None, "ms": None, "error": str(getattr(e, "reason", e))[:120], "up": False}
+    return {"code": code, "ms": round((time.monotonic() - t0) * 1000, 1), "error": "", "up": code < 500, "body": body}
+
+
+def base_url(url: str) -> str:
+    """scheme://host[:port]/ of a URL: query and path dropped, so no key or id can leak into the page."""
+    p = urllib.parse.urlsplit(url or "")
+    return f"{p.scheme}://{p.netloc}/" if p.scheme and p.netloc else ""
+
+
+def mysql_rows(defaults_file: str, host: str, sql: str, timeout: float = 5.0) -> "tuple[list[list[str]] | None, float, str]":
+    """Rows of sql through the mysql CLI (a remote server), wall time in ms, error text."""
+    t0 = time.monotonic()
+    try:
+        p = subprocess.run(["mysql", f"--defaults-file={defaults_file}", f"--host={host}", "--connect-timeout=3",
+                            "--batch", "--skip-column-names", "-e", sql],
+                           capture_output=True, text=True, timeout=timeout)
+    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+        return None, 0.0, str(e)[:120]
+    ms = round((time.monotonic() - t0) * 1000, 1)
+    if p.returncode != 0:
+        return None, ms, p.stderr.strip().splitlines()[-1][:160] if p.stderr.strip() else f"exit {p.returncode}"
+    return [l.split("\t") for l in p.stdout.splitlines()], ms, ""
+
+
+class IntegrationMonitor:
+    """The integrations a utility server runs or depends on, checked every every_s in a thread of its own
+    (a slow Eventor must not hold up the 5 s system samples). Off when [integration] is absent.
+
+    - fetchteams: the team changes service's own /health.json
+    - eventor: the Eventor base URL fetchteams uses (from its health.json, path and query dropped)
+    - mysql_primary: SELECT 1 and the unapplied zz_teamchanges rows on the OLA primary, as a read-only account;
+      the role comes from the primary's own healthcheck (peer_url), so no REPLICATION CLIENT grant is needed
+    - ola_primary: the OLA Java process as the primary's healthcheck sees it
+    - http_<name>: every name=url in http_checks
+    """
+
+    def __init__(self, cfg: configparser.ConfigParser) -> None:
+        s = cfg["integration"] if cfg.has_section("integration") else {}
+        self.enabled     = bool(s)
+        self.every       = float(s.get("every_s", "30"))
+        self.fetchteams  = s.get("fetchteams_url", "").strip()
+        self.peer        = s.get("peer_url", "").strip()
+        self.my_defaults = s.get("mysql_defaults_file", "/etc/10mila-sysmon/integration.cnf").strip()
+        self.my_host     = s.get("mysql_host", "").strip()
+        self.my_db       = s.get("mysql_database", "tiomilaprod").strip()
+        self.pending_max = float(s.get("pending_max_age_s", "300"))
+        self.fetch_max   = float(s.get("fetch_max_age_s", "300"))
+        self.checks      = [c.split("=", 1) for c in s.get("http_checks", "").split() if "=" in c]
+        self.last: dict = {"available": False, "checks": []}
+
+    def start(self) -> None:
+        if not self.enabled:
+            return
+        def loop() -> None:
+            while True:
+                try:
+                    self.last = self.sample()
+                except Exception as e:                           # never let the thread die
+                    self.last = {"available": False, "error": str(e)[:160], "checks": []}
+                time.sleep(self.every)
+        threading.Thread(target=loop, daemon=True, name="integration").start()
+
+    @staticmethod
+    def card(key: str, label: str, ok: "bool | None", value: str, sub: str, **raw) -> dict:
+        """One box on healthcheck.html and one key in services.json (available = healthy)."""
+        return {"key": key, "label": label, "ok": ok, "available": ok is True, "value": value, "sub": sub, **raw}
+
+    def check_fetchteams(self) -> "tuple[dict, dict]":
+        r = http_probe(self.fetchteams)
+        try:
+            h = json.loads(r.get("body") or b"{}") if r["code"] == 200 else {}
+        except ValueError:
+            h = {}
+        if not h:
+            return self.card("fetchteams", "Team changes (fetchteams)", False, "DOWN",
+                             r["error"] or f"HTTP {r['code']}", code=r["code"]), {}
+        age = h.get("last_fetch_age_s")
+        err = h.get("last_error") or h.get("web_error") or h.get("db_refused") or ""
+        stale = h.get("running") and age is not None and age > self.fetch_max
+        ok = bool(h.get("ok")) and not err and not stale
+        value = "STOPPED" if not h.get("running") else ("OK" if ok else "ALARM")
+        sub = (f"fetch {age:.0f}s ago" if age is not None else "no fetch yet") + \
+              (f" · Eventor {h['eventor_ms']:.0f} ms" if h.get("eventor_ms") is not None else "") + \
+              f" · labels {h.get('label_rows', 0)} · events {h.get('events', 0)}" + (f" · {err}" if err else "")
+        keep = ("running", "last_fetch_age_s", "eventor_ms", "eventor_teams", "eventor_changes", "label_rows",
+                "last_label_age_s", "last_error", "web_error", "db_refused", "db_ms", "events", "uptime_s")
+        return self.card("fetchteams", "Team changes (fetchteams)", ok, value, sub,
+                         **{k: h.get(k) for k in keep}), h
+
+    def check_http(self, key: str, label: str, url: str) -> dict:
+        r = http_probe(url)
+        sub = (f"HTTP {r['code']} · {r['ms']:.0f} ms" if r["code"] else r["error"]) + f" · {url}"
+        return self.card(key, label, r["up"], "UP" if r["up"] else "DOWN", sub, code=r["code"], ms=r["ms"], url=url)
+
+    def check_mysql(self, role: "str | None") -> dict:
+        db = self.my_db if re.fullmatch(r"\w+", self.my_db) else "tiomilaprod"
+        rows, ms, err = mysql_rows(self.my_defaults, self.my_host,
+            f"SELECT 1; SELECT COUNT(*), IFNULL(TIMESTAMPDIFF(SECOND, MIN(created), NOW()), 0) "
+            f"FROM {db}.zz_teamchanges WHERE applied IS NULL")
+        if rows is None:
+            return self.card("mysql_primary", "MySQL primary", False, "DOWN", f"{self.my_host}: {err}",
+                             host=self.my_host, ms=ms or None)
+        pending, oldest = (int(rows[1][0]), int(rows[1][1])) if len(rows) > 1 else (0, 0)
+        ok = oldest <= self.pending_max and role in (None, "source")
+        sub = f"{self.my_host} · {ms:.0f} ms · {role or 'role ?'} · pending {pending}" + \
+              (f", oldest {oldest}s" if pending else "")
+        return self.card("mysql_primary", "MySQL primary", ok, "OK" if ok else "ALARM", sub, host=self.my_host,
+                         ms=ms, role=role, pending=pending, oldest_pending_s=oldest)
+
+    def sample(self) -> dict:
+        checks, h = [], {}
+        if self.fetchteams:
+            c, h = self.check_fetchteams()
+            checks.append(c)
+        peer, role = {}, None
+        if self.peer:
+            r = http_probe(self.peer)
+            try:
+                peer = json.loads(r.get("body") or b"{}").get("services", {}) if r["code"] == 200 else {}
+            except ValueError:
+                peer = {}
+            role = peer.get("replication", {}).get("role") if peer else None
+        if self.my_host:
+            checks.append(self.check_mysql(role))
+        if self.peer:
+            j = peer.get("ola_java", {})
+            up = bool(j.get("available"))
+            checks.append(self.card("ola_primary", "OLA Java on the primary", up if peer else False,
+                                    "RUNNING" if up else ("DOWN" if peer else "NO DATA"),
+                                    f"CPU {j.get('cpu_pct', 0)}% · {j.get('mem_mb', 0):.0f} MB · up {j.get('uptime_s', 0) // 60:.0f} min"
+                                    if up else f"healthcheck {base_url(self.peer) or self.peer}",
+                                    **{k: j.get(k) for k in ("cpu_pct", "mem_mb", "threads", "uptime_s")}))
+        ev = base_url(h.get("eventor_url", ""))
+        if ev:
+            checks.append(self.check_http("eventor", "Eventor", ev))
+        for name, url in self.checks:
+            checks.append(self.check_http(f"http_{name}", name, url))
+        return {"available": all(c["ok"] for c in checks), "checked_at": time.time(), "checks": checks}
+
+
 # ─── Atomic JSON write ────────────────────────────────────────────────────────
 
 def write_json(path: str, data: dict) -> None:
@@ -1383,6 +1538,31 @@ def selftest() -> None:
         st2 = DeviceCounter("", path, 5).snapshot()
         assert st2["devices"] == 2 and st2["bot_hits"] == 2 and st2["since"] == st["since"], st2
         assert st2["by_country"] == st["by_country"], st2
+    # Integrations: off without [integration]; the Eventor URL loses path and query (the API key never shows).
+    assert not IntegrationMonitor(configparser.ConfigParser()).enabled
+    assert base_url("https://eventor.orientering.se/api/export/entries?eventId=1&apiKey=x") == "https://eventor.orientering.se/"
+    assert base_url("") == "" and base_url("garbage") == ""
+    with tempfile.TemporaryDirectory() as tmp:
+        health = {"ok": True, "running": True, "last_fetch_age_s": 12, "eventor_ms": 80, "label_rows": 3, "events": 9,
+                  "last_error": None, "web_error": None, "db_refused": None, "eventor_url": "http://127.0.0.1:9/api?k=1"}
+        Path(tmp, "health.json").write_text(json.dumps(health))
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), lambda *a: _SysmonHandler(*a, directory=tmp))
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        port = srv.server_address[1]
+        c = configparser.ConfigParser()
+        c.read_dict({"integration": {"fetchteams_url": f"http://127.0.0.1:{port}/health.json",
+                                     "http_checks": f"page=http://127.0.0.1:{port}/health.json gone=http://127.0.0.1:{port}/nope.json"}})
+        res = IntegrationMonitor(c).sample()
+        by = {x["key"]: x for x in res["checks"]}
+        assert by["fetchteams"]["ok"] is True and by["fetchteams"]["label_rows"] == 3, by["fetchteams"]
+        assert by["eventor"]["ok"] is False and by["eventor"]["url"] == "http://127.0.0.1:9/"     # nothing on port 9
+        assert by["http_page"]["ok"] is True and by["http_gone"]["code"] == 404 and by["http_gone"]["ok"] is True
+        assert res["available"] is False                                                        # Eventor down
+        Path(tmp, "health.json").write_text(json.dumps({**health, "db_refused": "server02 is a replica"}))
+        assert IntegrationMonitor(c).check_fetchteams()[0]["value"] == "ALARM"
+        Path(tmp, "health.json").write_text(json.dumps({**health, "last_fetch_age_s": 900}))
+        assert IntegrationMonitor(c).check_fetchteams()[0]["ok"] is False                       # stale fetch
+        srv.shutdown()
     print("selftest ok")
 
 
@@ -1447,6 +1627,8 @@ def main() -> None:
     proc_mon   = ProcessMonitor()
     tunnel_mon = TunnelMonitor(tunnel_port, tunnel_svc, probe_host, probe_port, probe_timeout)
     web_mon    = WebMonitor(nginx_url, fpm_url)
+    int_mon    = IntegrationMonitor(cfg)   # utility server only ([integration] in config.ini)
+    int_mon.start()
 
     # Restore history from existing JSON (keeps graphs continuous on restart)
     history = empty_history(history_size)
@@ -1508,6 +1690,8 @@ def main() -> None:
             "ssh_tunnel": tunnel_mon.sample(),
             "web": web_mon.sample(),
         }
+        if int_mon.enabled:
+            snapshot["integration"] = int_mon.last
 
         push_history(history, snapshot, processes)
         snapshot["history"] = serialise_history(history)
@@ -1549,6 +1733,8 @@ def main() -> None:
                                 "available": snapshot["mysql"].get("replication", {}).get("ok") is True},
                 "ssh_tunnel":  snapshot["ssh_tunnel"],
                 "web":         snapshot["web"],
+                # One key per integration check (fetchteams, mysql_primary, ola_primary, eventor, http_<name>).
+                **{c["key"]: c for c in snapshot.get("integration", {}).get("checks", [])},
             },
         }
 
