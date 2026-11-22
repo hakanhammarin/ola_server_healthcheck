@@ -1,0 +1,17 @@
+[Unit]
+Description=10mila SMART disk health snapshot for the healthcheck (bare metal only)
+# Root only for smartctl's raw disk access. The collector (user sysmon) just reads the file.
+ConditionVirtualization=no
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/10mila-sysmon/collector.py --smart-collect /var/lib/10mila-sysmon/smart.json
+StateDirectory=10mila-sysmon
+StateDirectoryMode=0755
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateNetwork=true
+NoNewPrivileges=true
+CapabilityBoundingSet=CAP_SYS_RAWIO CAP_SYS_ADMIN
+TimeoutStartSec=300

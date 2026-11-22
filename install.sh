@@ -3,6 +3,8 @@
 #
 # Run as root:   sudo bash install.sh
 # Uninstall:     sudo bash install.sh --uninstall
+# SMART:         --smart installs smartmontools and the root timer 10mila-smart (bare metal), --no-smart removes the
+#                timer; with neither, bare metal (systemd-detect-virt) decides. The page shows it with [smart] enabled = yes.
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
@@ -20,13 +22,16 @@ error() { echo -e "${RED}[error]${NC}  $*"; exit 1; }
 
 # ─── Root check ──────────────────────────────────────────────────────────────
 [[ $EUID -eq 0 ]] || error "Run as root: sudo bash install.sh"
+SMART=auto
+case "${1:-}" in --smart) SMART=yes ;; --no-smart) SMART=no ;; esac
+if [[ "$SMART" == auto ]]; then systemd-detect-virt -q && SMART=no || SMART=yes; fi
 
 # ─── Uninstall ────────────────────────────────────────────────────────────────
 if [[ "${1:-}" == "--uninstall" ]]; then
     info "Stopping and disabling service..."
-    systemctl stop  "$SERVICE_NAME" 2>/dev/null || true
-    systemctl disable "$SERVICE_NAME" 2>/dev/null || true
-    rm -f "/etc/systemd/system/${SERVICE_NAME}.service"
+    systemctl stop  "$SERVICE_NAME" 10mila-smart.timer 2>/dev/null || true
+    systemctl disable "$SERVICE_NAME" 10mila-smart.timer 2>/dev/null || true
+    rm -f "/etc/systemd/system/${SERVICE_NAME}.service" /etc/systemd/system/10mila-smart.{service,timer}
     systemctl daemon-reload
     info "Removing files..."
     rm -rf "$INSTALL_DIR"
@@ -143,6 +148,24 @@ fpm_url       = http://127.0.0.1:8080/fpm_status
 # nginx sends one syslog datagram per HTML page load to this unix socket. Empty = off.
 socket          =
 statistics_file = statistics.json
+
+[smart]
+# SMART disk health from 10mila-smart.timer (bare metal only; a VM shows "not applicable"). OK/WARN/FAIL per disk.
+enabled = no
+# Thresholds (defaults shown). Wear = % of rated endurance used. NVMe available_spare: WARN below its threshold
+# + spare_margin_pct, FAIL at the threshold. realloc = ATA 5, pending = ATA 197 and 198. NVMe uses its own
+# WCTEMP/CCTEMP instead of temp_*. SMART data older than max_age_s = WARN. No comments after a value.
+# file = /var/lib/10mila-sysmon/smart.json
+# wear_warn_pct = 80
+# wear_fail_pct = 90
+# spare_margin_pct = 10
+# realloc_warn = 1
+# realloc_fail = 10
+# pending_fail = 1
+# media_errors_warn = 1
+# temp_warn_c = 60
+# temp_fail_c = 70
+# max_age_s = 1800
 EOF
     chmod 640 "$CONFIG_FILE"
     chown root:"$SERVICE_USER" "$CONFIG_FILE"
@@ -208,6 +231,21 @@ cp "$SCRIPT_DIR/10mila-sysmon.service" "/etc/systemd/system/${SERVICE_NAME}.serv
 systemctl daemon-reload
 systemctl enable "$SERVICE_NAME"
 systemctl restart "$SERVICE_NAME"
+
+# ─── SMART disk health (bare metal only) ─────────────────────────────────────
+if [[ "$SMART" == yes ]]; then
+    info "SMART: smartmontools and the root timer 10mila-smart (every 10 min)..."
+    command -v smartctl >/dev/null || DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends smartmontools >/dev/null
+    cp "$SCRIPT_DIR/10mila-smart.service" "$SCRIPT_DIR/10mila-smart.timer" /etc/systemd/system/
+    systemctl daemon-reload
+    systemctl enable --now 10mila-smart.timer >/dev/null 2>&1
+    systemctl start 10mila-smart.service || warn "first SMART run failed: journalctl -u 10mila-smart"
+elif [[ -f /etc/systemd/system/10mila-smart.timer ]]; then
+    info "SMART: not bare metal, removing the timer"
+    systemctl disable --now 10mila-smart.timer >/dev/null 2>&1 || true
+    rm -f /etc/systemd/system/10mila-smart.{service,timer} /var/lib/10mila-sysmon/smart.json
+    systemctl daemon-reload
+fi
 
 sleep 2
 if systemctl is-active --quiet "$SERVICE_NAME"; then

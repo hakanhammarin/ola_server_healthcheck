@@ -1213,6 +1213,142 @@ class IntegrationMonitor:
         return {"available": all(c["ok"] for c in checks), "checked_at": time.time(), "checks": checks}
 
 
+# ─── SMART disk health (bare metal only) ─────────────────────────────────────
+# Root runs `collector.py --smart-collect FILE` from 10mila-smart.timer (smartctl needs raw disk access); the
+# collector itself never gets any rights: it reads FILE and judges it against [smart] in config.ini. Device names
+# come only from `smartctl --scan-open`, never from input, and smartctl gets an argument list, never a shell.
+
+SMART_FILE = "/var/lib/10mila-sysmon/smart.json"
+SMART_THRESHOLDS = {            # [smart] in config.ini overrides any of these
+    "wear_warn_pct": 80, "wear_fail_pct": 90,           # % of rated endurance used
+    "spare_margin_pct": 10,                             # NVMe available_spare: WARN below threshold + margin, FAIL at threshold
+    "realloc_warn": 1, "realloc_fail": 10,              # ATA 5 Reallocated_Sector_Ct
+    "pending_fail": 1,                                  # ATA 197 pending and 198 offline uncorrectable
+    "media_errors_warn": 1,                             # NVMe media_errors
+    "temp_warn_c": 60, "temp_fail_c": 70,               # NVMe uses its own WCTEMP/CCTEMP when it reports them
+    "max_age_s": 1800,                                  # older SMART data = WARN (the timer runs every 10 min)
+}
+SMART_RANK = {"OK": 0, "WARN": 1, "FAIL": 2}
+# Normalized value = % life left on these, by vendor: Samsung 177, Kingston/others 231, Intel 233, Crucial 202, WD 169.
+SMART_WEAR_ATTRS = (177, 231, 233, 202, 169)
+
+
+def smart_facts(d: dict) -> dict:
+    """The few numbers that matter, from one `smartctl --json -x` answer (ATA/SATA or NVMe)."""
+    nv = d.get("nvme_smart_health_information_log") or {}
+    attrs = {a.get("id"): a for a in (d.get("ata_smart_attributes") or {}).get("table", [])}
+    raw = lambda i: (attrs[i].get("raw") or {}).get("value") if i in attrs else None
+    stats = {t.get("name"): t.get("value") for p in (d.get("ata_device_statistics") or {}).get("pages", [])
+             for t in p.get("table", []) if (t.get("flags") or {}).get("valid", True)}
+    wear, src = None, ""
+    if nv.get("percentage_used") is not None:
+        wear, src = nv["percentage_used"], "NVMe percentage_used"
+    elif (d.get("endurance_used") or {}).get("current_percent") is not None:
+        wear, src = d["endurance_used"]["current_percent"], "endurance_used"
+    elif stats.get("Percentage Used Endurance Indicator") is not None:
+        wear, src = stats["Percentage Used Endurance Indicator"], "Percentage Used Endurance Indicator"
+    else:
+        for i in SMART_WEAR_ATTRS:
+            a = attrs.get(i)
+            if a and "temp" not in a.get("name", "").lower() and a.get("value") is not None:
+                wear, src = 100 - a["value"], f"{i} {a.get('name', '')}"
+                break
+    temp = d.get("temperature") or {}
+    nvme = (d.get("device") or {}).get("protocol") == "NVMe"
+    thr = d.get("nvme_composite_temperature_threshold") or {}
+    return {
+        "name": (d.get("device") or {}).get("name", ""), "protocol": (d.get("device") or {}).get("protocol", ""),
+        "model": d.get("model_name", ""), "serial": d.get("serial_number", ""), "firmware": d.get("firmware_version", ""),
+        "size_gb": round((d.get("user_capacity") or {}).get("bytes", 0) / 1e9) or None,
+        "kind": "NVMe" if nvme else ("HDD" if d.get("rotation_rate") else "SSD"),
+        "supported": "smart_status" in d,
+        "passed": (d.get("smart_status") or {}).get("passed"),
+        "temp_c": temp.get("current", nv.get("temperature")),
+        "temp_warn_c": (thr.get("warning") or temp.get("op_limit_max")) if nvme else None,
+        "temp_fail_c": (thr.get("critical") or temp.get("critical_limit_max")) if nvme else None,
+        "power_on_hours": (d.get("power_on_time") or {}).get("hours", nv.get("power_on_hours")),
+        "wear_used_pct": wear, "wear_source": src,
+        "available_spare": nv.get("available_spare"), "spare_threshold": nv.get("available_spare_threshold"),
+        "reallocated": raw(5), "pending": raw(197), "uncorrectable": raw(198),
+        "media_errors": nv.get("media_errors"), "critical_warning": nv.get("critical_warning"),
+        "error": "; ".join(m.get("string", "") for m in (d.get("smartctl") or {}).get("messages", [])
+                           if m.get("severity") == "error")[:200],
+    }
+
+
+def smart_judge(f: dict, t: dict) -> dict:
+    """OK / WARN / FAIL for one disk, with a reason per finding (N/A when the device has no SMART)."""
+    if not f.get("supported"):
+        return {"status": "N/A", "reasons": [f.get("error") or "no SMART on this device"]}
+    out: list = []
+    def check(level: str, cond: bool, text: str) -> None:
+        if cond:
+            out.append((level, text))
+    v = lambda k: f.get(k)
+    check("FAIL", v("passed") is False, "SMART overall-health FAILED")
+    if v("wear_used_pct") is not None:
+        w = v("wear_used_pct")
+        check("FAIL", w >= t["wear_fail_pct"], f"wear {w}% used >= {t['wear_fail_pct']}%")
+        check("WARN", t["wear_warn_pct"] <= w < t["wear_fail_pct"], f"wear {w}% used >= {t['wear_warn_pct']}%")
+    if v("available_spare") is not None and v("spare_threshold") is not None:
+        s, th = v("available_spare"), v("spare_threshold")
+        check("FAIL", s <= th, f"spare {s}% <= threshold {th}%")
+        check("WARN", th < s < th + t["spare_margin_pct"], f"spare {s}% < threshold {th}% + {t['spare_margin_pct']}")
+    if v("reallocated") is not None:
+        r = v("reallocated")
+        check("FAIL", r >= t["realloc_fail"], f"reallocated {r} >= {t['realloc_fail']}")
+        check("WARN", t["realloc_warn"] <= r < t["realloc_fail"], f"reallocated {r}")
+    for k in ("pending", "uncorrectable"):
+        check("FAIL", (v(k) or 0) >= t["pending_fail"], f"{k} {v(k)}")
+    check("WARN", (v("media_errors") or 0) >= t["media_errors_warn"], f"media errors {v('media_errors')}")
+    check("FAIL", bool(v("critical_warning")), f"NVMe critical_warning 0x{(v('critical_warning') or 0):02x}")
+    if v("temp_c") is not None:
+        tw, tf = v("temp_warn_c") or t["temp_warn_c"], v("temp_fail_c") or t["temp_fail_c"]
+        check("FAIL", v("temp_c") >= tf, f"{v('temp_c')} °C >= {tf} °C")
+        check("WARN", tw <= v("temp_c") < tf, f"{v('temp_c')} °C >= {tw} °C")
+    status = max((lvl for lvl, _ in out), key=SMART_RANK.get, default="OK")
+    return {"status": status, "reasons": [txt for _, txt in out]}
+
+
+def smart_collect(path: str) -> None:
+    """Root only (10mila-smart.timer): every disk smartctl finds -> its facts in path (atomic, world-readable)."""
+    run = lambda *a: subprocess.run(["smartctl", "--json", *a], capture_output=True, text=True, timeout=120).stdout
+    disks = []
+    for dev in json.loads(run("--scan-open") or "{}").get("devices", []):
+        name, typ = dev.get("name", ""), dev.get("type", "")
+        if not re.fullmatch(r"/dev/[\w/.-]+", name) or not re.fullmatch(r"[\w,+-]+", typ):
+            continue
+        try:
+            disks.append(smart_facts(json.loads(run("-x", "-d", typ, name))))
+        except (ValueError, subprocess.TimeoutExpired) as e:
+            disks.append({"name": name, "supported": False, "error": f"smartctl: {e}"[:200]})
+    write_json(path, {"collected_at": time.time(), "disks": disks})
+
+
+def smart_read(cfg: configparser.ConfigParser) -> dict:
+    """The SMART box on healthcheck.html: not applicable without [smart] enabled = yes (VMs, AWS)."""
+    if not cfg.getboolean("smart", "enabled", fallback=False):
+        return {"applicable": False, "note": "not applicable (VM)"}
+    t = {k: cfg.getfloat("smart", k, fallback=v) for k, v in SMART_THRESHOLDS.items()}
+    t = {k: int(v) if v == int(v) else v for k, v in t.items()}
+    path = cfg.get("smart", "file", fallback=SMART_FILE)
+    try:
+        with open(path) as fh:
+            raw = json.load(fh)
+    except (OSError, ValueError) as e:
+        return {"applicable": True, "status": "WARN", "reasons": [f"no SMART data: {e}"[:160]],
+                "disks": [], "thresholds": t}
+    age = time.time() - raw.get("collected_at", 0)
+    disks = [{**f, **smart_judge(f, t)} for f in raw.get("disks", [])]
+    judged = [x["status"] for x in disks if x["status"] != "N/A"]
+    reasons = [] if judged else ["no disk with SMART found"]
+    if age > t["max_age_s"]:
+        reasons.append(f"SMART data {age / 60:.0f} min old")
+    status = max(judged + (["WARN"] if reasons else []), key=SMART_RANK.get, default="WARN")
+    return {"applicable": True, "status": status, "reasons": reasons, "age_s": round(age),
+            "disks": disks, "thresholds": t}
+
+
 # ─── Atomic JSON write ────────────────────────────────────────────────────────
 
 def write_json(path: str, data: dict) -> None:
@@ -1592,6 +1728,51 @@ def selftest() -> None:
         finally:
             g["mysql_rows"] = real
         srv.shutdown()
+    # SMART: the real SATA SSD in server01 (HPE VK000240GWSRQ), trimmed, and an NVMe drive.
+    t = dict(SMART_THRESHOLDS)
+    sata = {"device": {"name": "/dev/sda", "protocol": "ATA"}, "model_name": "VK000240GWSRQ", "rotation_rate": 0,
+            "smart_status": {"passed": True}, "temperature": {"current": 29, "op_limit_max": 60},
+            "power_on_time": {"hours": 42500},
+            "ata_smart_attributes": {"table": [{"id": 5, "name": "Reallocated_Sector_Ct", "value": 100, "raw": {"value": 0}},
+                                               {"id": 202, "name": "Unknown_SSD_Attribute", "value": 100, "raw": {"value": 0}}]},
+            "ata_device_statistics": {"pages": [{"table": [{"name": "Percentage Used Endurance Indicator", "value": 2,
+                                                            "flags": {"valid": True}}]}]}}
+    f = smart_facts(sata)
+    assert f["wear_used_pct"] == 2 and f["kind"] == "SSD" and f["temp_warn_c"] is None and f["reallocated"] == 0, f
+    assert smart_judge(f, t) == {"status": "OK", "reasons": []}
+    assert smart_judge({**f, "wear_used_pct": 85}, t)["status"] == "WARN"
+    assert smart_judge({**f, "wear_used_pct": 90}, t)["status"] == "FAIL"
+    assert smart_judge({**f, "reallocated": 3}, t)["status"] == "WARN"
+    assert smart_judge({**f, "reallocated": 10}, t)["status"] == "FAIL"
+    assert smart_judge({**f, "pending": 1}, t)["status"] == "FAIL" and smart_judge({**f, "uncorrectable": 2}, t)["status"] == "FAIL"
+    assert smart_judge({**f, "temp_c": 60}, t)["status"] == "WARN" and smart_judge({**f, "temp_c": 70}, t)["status"] == "FAIL"
+    assert smart_judge({**f, "passed": False}, t)["status"] == "FAIL"
+    del sata["ata_device_statistics"]
+    sata["ata_smart_attributes"]["table"].append({"id": 177, "name": "Wear_Leveling_Count", "value": 13, "raw": {"value": 3000}})
+    assert smart_facts(sata)["wear_used_pct"] == 87 and smart_facts(sata)["wear_source"].startswith("177")
+    nvme = {"device": {"name": "/dev/nvme0", "protocol": "NVMe"}, "smart_status": {"passed": True},
+            "temperature": {"current": 75}, "nvme_composite_temperature_threshold": {"warning": 80, "critical": 85},
+            "nvme_smart_health_information_log": {"percentage_used": 5, "available_spare": 100,
+                                                  "available_spare_threshold": 10, "media_errors": 0, "critical_warning": 0}}
+    f = smart_facts(nvme)
+    assert f["kind"] == "NVMe" and f["temp_warn_c"] == 80 and smart_judge(f, t)["status"] == "OK", smart_judge(f, t)   # 75 °C < WCTEMP
+    assert smart_judge({**f, "available_spare": 15}, t)["status"] == "WARN"
+    assert smart_judge({**f, "available_spare": 10}, t)["status"] == "FAIL"
+    assert smart_judge({**f, "media_errors": 1}, t)["status"] == "WARN"
+    assert smart_judge({**f, "critical_warning": 4}, t)["status"] == "FAIL"
+    assert smart_judge(smart_facts({"device": {"name": "/dev/sdb"}}), t)["status"] == "N/A"   # card reader, no SMART
+    assert smart_read(configparser.ConfigParser())["applicable"] is False
+    with tempfile.TemporaryDirectory() as tmp:
+        c = configparser.ConfigParser()
+        c.read_dict({"smart": {"enabled": "yes", "file": os.path.join(tmp, "smart.json"), "temp_warn_c": "25"}})
+        assert smart_read(c)["status"] == "WARN"                                         # no file yet
+        write_json(os.path.join(tmp, "smart.json"), {"collected_at": time.time(), "disks": [smart_facts(nvme), smart_facts(sata)]})
+        r = smart_read(c)
+        assert r["status"] == "WARN" and r["thresholds"]["temp_warn_c"] == 25, r       # SATA 29 °C >= 25; NVMe keeps WCTEMP 80
+        assert [x["status"] for x in r["disks"]] == ["OK", "WARN"], r["disks"]
+        write_json(os.path.join(tmp, "smart.json"), {"collected_at": time.time() - 4000, "disks": [smart_facts(nvme)]})
+        r = smart_read(c)
+        assert r["status"] == "WARN" and "min old" in r["reasons"][0], r                  # stale data
     print("selftest ok")
 
 
@@ -1599,9 +1780,13 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="10mila system + MySQL monitor")
     parser.add_argument("--config", default=DEFAULT_CONFIG)
     parser.add_argument("--selftest", action="store_true", help="check the parsers and exit")
+    parser.add_argument("--smart-collect", metavar="FILE", help="as root: write every disk's SMART facts to FILE and exit")
     args = parser.parse_args()
     if args.selftest:
         selftest()
+        return
+    if args.smart_collect:
+        smart_collect(args.smart_collect)
         return
 
     cfg = load_config(args.config)
@@ -1721,6 +1906,7 @@ def main() -> None:
         }
         if int_mon.enabled:
             snapshot["integration"] = int_mon.last
+        snapshot["smart"] = smart_read(cfg)
 
         push_history(history, snapshot, processes)
         snapshot["history"] = serialise_history(history)
@@ -1766,6 +1952,13 @@ def main() -> None:
                 **{c["key"]: c for c in snapshot.get("integration", {}).get("checks", [])},
             },
         }
+        sm = snapshot["smart"]
+        if sm["applicable"]:   # bare metal only: a VM has no "smart" key, so the central monitoring never alarms on it
+            services_snapshot["services"]["smart"] = {
+                "available": sm["status"] == "OK", "status": sm["status"], "reasons": sm["reasons"],
+                "age_s": sm.get("age_s"),
+                "disks": [{k: x.get(k) for k in ("name", "model", "kind", "status", "reasons", "wear_used_pct",
+                                                 "temp_c", "power_on_hours")} for x in sm["disks"]]}
 
         try:
             write_json(output_path, snapshot)

@@ -1,0 +1,9 @@
+[Unit]
+Description=10mila SMART disk health snapshot every 10 minutes
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=10min
+
+[Install]
+WantedBy=timers.target

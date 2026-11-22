@@ -134,6 +134,7 @@
   }
   .status-green { border-left: 3px solid var(--green); }
   .status-red   { border-left: 3px solid var(--red);   }
+  .status-yellow { border-left: 3px solid var(--yellow); }
 
   @media (max-width: 600px) {
     .charts { grid-template-columns: 1fr; }
@@ -278,6 +279,11 @@
   <!-- Integrations (utility server only: [integration] in config.ini) -->
   <div class="section-title int-only" id="int-section-title" style="display:none">Integrations</div>
   <div class="gauges int-only" id="int-gauges" style="display:none"></div>
+
+  <!-- SMART disk health: bare metal only ([smart] enabled = yes); a VM gets one "not applicable" line, no alarm -->
+  <div class="section-title" id="smart-section-title">Disks (SMART)</div>
+  <div class="gauges" id="smart-gauges"></div>
+  <div class="card-sub" id="smart-thresholds" style="margin:4px 0 12px"></div>
 
   <!-- NGINX + PHP-FPM gauges (shown only when nginx is running on this server) -->
   <div class="section-title web-only" id="web-section-title" style="display:none">NGINX / PHP-FPM</div>
@@ -933,6 +939,41 @@ function updateCharts(hist) {
 // ── Polling ───────────────────────────────────────────────────────────────────
 let lastTs = null;
 
+// SMART: one box per disk (status, wear, temperature, hours, reasons), colours from the collector's OK/WARN/FAIL.
+function updateSmart(sm) {
+  const esc = v => String(v ?? '').replace(/[&<>"]/g, ch => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;'}[ch]));
+  const title = document.getElementById('smart-section-title'), box = document.getElementById('smart-gauges');
+  const thr = document.getElementById('smart-thresholds');
+  if (!sm || !sm.applicable) {
+    title.innerHTML = 'Disks (SMART) <span class="card-sub">not applicable (VM)</span>';
+    box.innerHTML = ''; thr.textContent = ''; return;
+  }
+  const col = st => ({OK: 'var(--green)', WARN: 'var(--yellow)', FAIL: 'var(--red)'}[st] || 'var(--muted)');
+  const cls = st => ({OK: ' status-green', WARN: ' status-yellow', FAIL: ' status-red'}[st] || '');
+  title.innerHTML = `Disks (SMART) <span style="color:${col(sm.status)}">${esc(sm.status)}</span>` +
+    (sm.reasons || []).map(r => ` <span class="offline-badge">${esc(r)}</span>`).join('');
+  box.innerHTML = (sm.disks || []).map(x => {
+    const bits = [x.kind, x.size_gb ? x.size_gb + ' GB' : '',
+                  x.wear_used_pct != null ? `wear ${x.wear_used_pct}% used` : '',
+                  x.available_spare != null ? `spare ${x.available_spare}%` : '',
+                  x.temp_c != null ? `${x.temp_c} °C` : '',
+                  x.power_on_hours != null ? `${x.power_on_hours.toLocaleString('sv-SE')} h` : '',
+                  x.reallocated != null ? `realloc ${x.reallocated}` : '',
+                  x.pending != null ? `pending ${x.pending}` : '',
+                  x.uncorrectable != null ? `uncorr ${x.uncorrectable}` : '',
+                  x.media_errors != null ? `media err ${x.media_errors}` : ''].filter(Boolean).join(' · ');
+    return `<div class="card${cls(x.status)}" title="${esc(x.serial)} ${esc(x.firmware)} · wear from ${esc(x.wear_source)}">` +
+           `<div class="card-label">${esc(x.name)} ${esc(x.model)}</div>` +
+           `<div class="card-value" style="color:${col(x.status)}">${esc(x.status)}</div>` +
+           `<div class="card-sub">${esc(bits)}${(x.reasons || []).length ? '<br>' + esc(x.reasons.join(' · ')) : ''}</div></div>`;
+  }).join('');
+  const t = sm.thresholds || {};
+  thr.textContent = `Thresholds: wear WARN ≥${t.wear_warn_pct}% FAIL ≥${t.wear_fail_pct}% · spare WARN < threshold+${t.spare_margin_pct} FAIL ≤ threshold` +
+    ` · reallocated WARN ≥${t.realloc_warn} FAIL ≥${t.realloc_fail} · pending/uncorrectable FAIL ≥${t.pending_fail}` +
+    ` · media errors WARN ≥${t.media_errors_warn} · critical_warning FAIL ≠0 · temp WARN ≥${t.temp_warn_c} °C FAIL ≥${t.temp_fail_c} °C` +
+    ` (NVMe: own WCTEMP/CCTEMP) · overall-health failed = FAIL · data ${sm.age_s ?? '—'} s old`;
+}
+
 async function poll() {
   try {
     const resp = await fetch(JSON_URL + '?_=' + Date.now());
@@ -946,6 +987,7 @@ async function poll() {
     updateTunnel(data.ssh_tunnel);
     updateWeb(data.web);
     updateIntegration(data.integration);
+    updateSmart(data.smart);
     updateCharts(data.history);
 
   } catch (err) {

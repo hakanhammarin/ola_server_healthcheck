@@ -143,6 +143,29 @@ Keys: `fetchteams`, `mysql_primary` (ms, role, pending, oldest_pending_s), `ola_
 The MySQL role comes from the primary's healthcheck, so the read-only account needs no REPLICATION CLIENT grant.
 Any HTTP answer below 500 counts as up (a PIN page or a 401 is a live service).
 
+## SMART disk health (bare metal only)
+
+`sudo bash install.sh --smart` installs smartmontools and the root timer `10mila-smart.timer` (every 10 min,
+`ConditionVirtualization=no`). It runs `collector.py --smart-collect /var/lib/10mila-sysmon/smart.json`: every disk
+from `smartctl --scan-open`, `smartctl --json -x` each, the facts that matter written atomically. The collector
+(user `sysmon`, no extra rights, no sudo) reads that file and judges it against `[smart]` in config.ini
+(`enabled = yes`; the default `no` shows "not applicable (VM)" and puts nothing in services.json).
+
+| Check | WARN | FAIL | config key (default) |
+|---|---|---|---|
+| overall health (`smart_status.passed`) | | failed | |
+| wear: NVMe `percentage_used`, ATA "Percentage Used Endurance Indicator", else 100 - normalized 177/231/233/202/169 | >= 80 % used | >= 90 % | `wear_warn_pct`, `wear_fail_pct` |
+| NVMe `available_spare` | < threshold + 10 | <= threshold | `spare_margin_pct` |
+| ATA 5 reallocated | >= 1 | >= 10 | `realloc_warn`, `realloc_fail` |
+| ATA 197 pending, 198 offline uncorrectable | | >= 1 | `pending_fail` |
+| NVMe `media_errors` | >= 1 | | `media_errors_warn` |
+| NVMe `critical_warning` | | != 0 | |
+| temperature (NVMe: its own WCTEMP/CCTEMP) | >= 60 °C | >= 70 °C | `temp_warn_c`, `temp_fail_c` |
+| data age | > 1800 s | | `max_age_s` |
+
+healthcheck.html shows one box per disk; healthcheck.json has `smart`; services.json has `services.smart`
+(`available` = status OK, plus `status` OK/WARN/FAIL) only where SMART applies. `--no-smart` removes the timer.
+
 ## File locations
 
 | Path | Description |
