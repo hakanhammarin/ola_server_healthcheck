@@ -1093,7 +1093,9 @@ class IntegrationMonitor:
     - fetchteams: the team changes service's own /health.json
     - eventor: the Eventor base URL fetchteams uses (from its health.json, path and query dropped)
     - mysql_primary: SELECT 1 and the unapplied zz_teamchanges rows on the OLA primary, as a read-only account;
-      the role comes from the primary's own healthcheck (peer_url), so no REPLICATION CLIENT grant is needed
+      the role comes from the primary's own healthcheck (peer_url), so no REPLICATION CLIENT grant is needed.
+      The host follows a failover: fetchteams' db_host (what the operators move) each run, mysql_host and peer_url
+      only while fetchteams does not answer; peer_url then points at that host (same port and path)
     - ola_primary: the OLA Java process as the primary's healthcheck sees it
     - http_<name>: every name=url in http_checks
     """
@@ -1130,7 +1132,7 @@ class IntegrationMonitor:
         return {"key": key, "label": label, "ok": ok, "available": ok is True, "value": value, "sub": sub, **raw}
 
     def check_fetchteams(self) -> "tuple[dict, dict]":
-        r = http_probe(self.fetchteams)
+        r = http_probe(self.fetchteams, 2.0)
         try:
             h = json.loads(r.get("body") or b"{}") if r["code"] == 200 else {}
         except ValueError:
@@ -1156,43 +1158,52 @@ class IntegrationMonitor:
         sub = (f"HTTP {r['code']} · {r['ms']:.0f} ms" if r["code"] else r["error"]) + f" · {url}"
         return self.card(key, label, r["up"], "UP" if r["up"] else "DOWN", sub, code=r["code"], ms=r["ms"], url=url)
 
-    def check_mysql(self, role: "str | None") -> dict:
+    def check_mysql(self, role: "str | None", host: str = "", source: str = "configured", refused: str = "") -> dict:
+        host = host or self.my_host
+        src = f"from {source}"
         db = self.my_db if re.fullmatch(r"\w+", self.my_db) else "tiomilaprod"
-        rows, ms, err = mysql_rows(self.my_defaults, self.my_host,
+        rows, ms, err = mysql_rows(self.my_defaults, host,
             f"SELECT 1; SELECT COUNT(*), IFNULL(TIMESTAMPDIFF(SECOND, MIN(created), NOW()), 0) "
             f"FROM {db}.zz_teamchanges WHERE applied IS NULL")
         if rows is None:
-            return self.card("mysql_primary", "MySQL primary", False, "DOWN", f"{self.my_host}: {err}",
-                             host=self.my_host, ms=ms or None)
+            return self.card("mysql_primary", "MySQL primary", False, "DOWN", f"{host} {src}: {err}",
+                             host=host, host_source=source, ms=ms or None)
         pending, oldest = (int(rows[1][0]), int(rows[1][1])) if len(rows) > 1 else (0, 0)
         ok = oldest <= self.pending_max and role in (None, "source")
-        sub = f"{self.my_host} · {ms:.0f} ms · {role or 'role ?'} · pending {pending}" + \
-              (f", oldest {oldest}s" if pending else "")
-        return self.card("mysql_primary", "MySQL primary", ok, "OK" if ok else "ALARM", sub, host=self.my_host,
-                         ms=ms, role=role, pending=pending, oldest_pending_s=oldest)
+        sub = f"host {host} {src} · {ms:.0f} ms · {role or 'role ?'} · pending {pending}" + \
+              (f", oldest {oldest}s" if pending else "") + (f" · fetchteams: {refused}" if refused else "")
+        return self.card("mysql_primary", "MySQL primary", ok, "OK" if ok else "ALARM", sub, host=host,
+                         host_source=source, ms=ms, role=role, pending=pending, oldest_pending_s=oldest)
 
     def sample(self) -> dict:
         checks, h = [], {}
         if self.fetchteams:
             c, h = self.check_fetchteams()
             checks.append(c)
+        # Follow a failover: the host fetchteams writes to, the configured one only while fetchteams is silent.
+        host, source = (h["db_host"], "fetchteams") if h.get("db_host") else \
+                       (self.my_host, "configured, fetchteams not answering" if not h else "configured")
+        peer_url = self.peer
+        if peer_url and host:
+            u = urllib.parse.urlsplit(peer_url)
+            peer_url = u._replace(netloc=f"{host}:{u.port}" if u.port else host).geturl()
         peer, role = {}, None
-        if self.peer:
-            r = http_probe(self.peer)
+        if peer_url:
+            r = http_probe(peer_url)
             try:
                 peer = json.loads(r.get("body") or b"{}").get("services", {}) if r["code"] == 200 else {}
             except ValueError:
                 peer = {}
             role = peer.get("replication", {}).get("role") if peer else None
-        if self.my_host:
-            checks.append(self.check_mysql(role))
-        if self.peer:
+        if host:
+            checks.append(self.check_mysql(role, host, source, h.get("db_refused") or ""))
+        if peer_url:
             j = peer.get("ola_java", {})
             up = bool(j.get("available"))
             checks.append(self.card("ola_primary", "OLA Java on the primary", up if peer else False,
                                     "RUNNING" if up else ("DOWN" if peer else "NO DATA"),
                                     f"CPU {j.get('cpu_pct', 0)}% · {j.get('mem_mb', 0):.0f} MB · up {j.get('uptime_s', 0) // 60:.0f} min"
-                                    if up else f"healthcheck {base_url(self.peer) or self.peer}",
+                                    if up else f"healthcheck {base_url(peer_url) or peer_url}",
                                     **{k: j.get(k) for k in ("cpu_pct", "mem_mb", "threads", "uptime_s")}))
         ev = base_url(h.get("eventor_url", ""))
         if ev:
@@ -1562,6 +1573,24 @@ def selftest() -> None:
         assert IntegrationMonitor(c).check_fetchteams()[0]["value"] == "ALARM"
         Path(tmp, "health.json").write_text(json.dumps({**health, "last_fetch_age_s": 900}))
         assert IntegrationMonitor(c).check_fetchteams()[0]["ok"] is False                       # stale fetch
+        # MySQL primary follows fetchteams' db_host (failover), role from that host's own services.json.
+        g = globals(); real = g["mysql_rows"]; seen = []
+        g["mysql_rows"] = lambda d, host, sql, timeout=5.0: (seen.append(host), ([["1"], ["0", "0"]], 4.0, ""))[1]
+        try:
+            Path(tmp, "health.json").write_text(json.dumps({**health, "db_host": "127.0.0.1", "db_refused": "replica"}))
+            Path(tmp, "services.json").write_text(json.dumps({"services": {"replication": {"role": "replica"}}}))
+            c["integration"].update(http_checks="", mysql_host="192.0.2.1", peer_url=f"http://192.0.2.1:{port}/services.json")
+            m = {x["key"]: x for x in IntegrationMonitor(c).sample()["checks"]}["mysql_primary"]
+            assert seen == ["127.0.0.1"] and m["host_source"] == "fetchteams" and m["role"] == "replica", m
+            assert m["ok"] is False and "from fetchteams" in m["sub"] and "fetchteams: replica" in m["sub"], m
+            Path(tmp, "services.json").write_text(json.dumps({"services": {"replication": {"role": "source"}}}))
+            Path(tmp, "health.json").write_text(json.dumps({**health, "db_host": "127.0.0.1"}))
+            assert {x["key"]: x for x in IntegrationMonitor(c).sample()["checks"]}["mysql_primary"]["ok"] is True
+            c["integration"]["fetchteams_url"] = f"http://127.0.0.1:{port}/nope.json"          # fetchteams silent
+            m = {x["key"]: x for x in IntegrationMonitor(c).sample()["checks"]}["mysql_primary"]
+            assert seen[-1] == "192.0.2.1" and m["host_source"] == "configured, fetchteams not answering", m
+        finally:
+            g["mysql_rows"] = real
         srv.shutdown()
     print("selftest ok")
 
